@@ -1245,9 +1245,27 @@ def render_pi5_architecture_page():
   </header>
   <main>
     <section class="block image-grid">
+      <figure><img src="/pi5-asset/pi5-board-retail-photo.jpg" alt="Raspberry Pi 5 board retail photo"><figcaption>실물 보드 전체 사진. 커넥터 위치와 포트 배치를 한눈에 보기 위한 참고 이미지.</figcaption></figure>
       <figure><img src="/pi5-asset/raspberry-pi-5.png" alt="Raspberry Pi 5 board"><figcaption>Raspberry Pi 5 board image, source: Raspberry Pi official product assets.</figcaption></figure>
       <figure><img src="/pi5-asset/bcm2712.png" alt="BCM2712 SoC"><figcaption>BCM2712 application processor close-up. CPU, GPU, memory, HDMI, PCIe root-side functions are centered here.</figcaption></figure>
       <figure><img src="/pi5-asset/rp1.png" alt="RP1 I/O controller"><figcaption>RP1 I/O controller close-up. RP1 handles much of the external I/O including USB, Ethernet, GPIO, and MIPI transceivers.</figcaption></figure>
+    </section>
+
+    <section class="block">
+      <h2>실물 보드 사진에서 확인할 포인트</h2>
+      <p>위 실물 사진은 DVS-CIS 합성 장비를 만들 때 더 직관적이다. 문서상의 블록 다이어그램은 BCM2712, RP1, MIPI, USB, PCIe 역할을 보여주지만, 실제 제작에서는 어느 케이블을 어디에 꽂고 열과 전원을 어떻게 처리할지가 더 중요하다.</p>
+      <table>
+        <thead><tr><th>사진에서 볼 부분</th><th>역할</th><th>DVS-CIS 합성 장비에서의 의미</th></tr></thead>
+        <tbody>
+          <tr><td>보드 중앙의 큰 SoC/방열 위치</td><td>BCM2712가 CPU/GPU/메모리 주변 처리를 담당</td><td>event accumulation, frame fusion, encode handoff가 몰리는 영역이다. 장시간 실시간 합성은 방열판과 팬이 필요하다.</td></tr>
+          <tr><td>두 개의 CAM/DISP FFC 커넥터</td><td>각각 4-lane MIPI CSI-2 camera 또는 DSI display로 사용 가능</td><td>CIS 센서는 이 포트에 연결하는 구성이 가장 안정적이다. dual camera도 가능하지만 DVS와 timestamp 동기화가 별도 과제다.</td></tr>
+          <tr><td>USB 3.0 포트</td><td>고속 외부 장치 입력</td><td>DVS 센서를 USB event stream으로 받을 때 가장 현실적인 입력 경로다. CIS는 MIPI, DVS는 USB로 분리하면 병목을 줄일 수 있다.</td></tr>
+          <tr><td>40-pin GPIO 헤더</td><td>3.3V GPIO, UART, SPI, I2C, PWM, trigger line</td><td>DVS와 CIS의 촬영 시작 신호, PPS, 외부 인터럽트, 보조 MCU 동기화에 사용한다.</td></tr>
+          <tr><td>PCIe FFC 커넥터</td><td>외부 PCIe 2.0 x1 확장</td><td>NVMe 저장장치 또는 AI accelerator HAT 연결 후보지만 대역폭은 x1이다. 고속 저장에는 유용하지만 대형 NPU급 처리 성능을 기대하면 안 된다.</td></tr>
+          <tr><td>USB-C 전원 입력</td><td>5V/5A PD 전원 권장</td><td>카메라, DVS, NVMe, 팬을 동시에 쓰면 전원 여유가 중요하다. 저전원 어댑터는 프레임 드롭과 USB 불안정 원인이 된다.</td></tr>
+        </tbody>
+      </table>
+      <p>따라서 실험용 배선은 CIS camera를 MIPI CAM 포트에, DVS를 USB 3.0에, 동기화 신호를 GPIO에, 결과 전송은 Ethernet에 두는 구성이 가장 단순하다. 이 구성은 Pi 5의 장점을 잘 쓰지만, 200FPS 이상 고품질 합성은 CPU만으로는 어렵기 때문에 C++/NEON 최적화나 외부 AI accelerator를 함께 검토해야 한다.</p>
     </section>
 
     <section class="block">

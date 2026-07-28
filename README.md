@@ -17,6 +17,7 @@ Raspberry Pi DVS/person-detection prototype backup.
 
 - `http://192.168.0.100:8080/`
 - `http://192.168.0.100:8080/person`
+- `http://192.168.0.100:8080/raspberry-pi5-architecture`
 - `http://192.168.0.100:8080/event-synthesis`
 - `http://192.168.0.100:8080/fall-plan`
 - `http://192.168.0.100:8081/`
