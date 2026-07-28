@@ -16,7 +16,11 @@ Raspberry Pi DVS/person-detection prototype backup.
 ## Dashboard URLs
 
 - `http://192.168.0.100:8080/`
+- `http://192.168.0.100:8080/person`
+- `http://192.168.0.100:8080/event-synthesis`
 - `http://192.168.0.100:8080/fall-plan`
 - `http://192.168.0.100:8081/`
+
+See `docs/web_routes.md` for the mapping between dashboard links, routes, and source files.
 
 This is a snapshot backup. For long-term generated image/video history, use Git LFS or object storage.
