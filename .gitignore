@@ -1,0 +1,15 @@
+﻿# OS/editor
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Secrets
+.env
+*.pem
+*.key
+id_rsa*
+known_hosts
+
+# Python
+__pycache__/
+*.pyc

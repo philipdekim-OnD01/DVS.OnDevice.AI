@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Raspberry Pi camera stack healthcheck every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=camera-stack-healthcheck.service
+
+[Install]
+WantedBy=timers.target

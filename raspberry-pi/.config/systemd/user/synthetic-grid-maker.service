@@ -1,0 +1,6 @@
+[Unit]
+Description=Create lightweight virtual DVS synthetic grid
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/philip/bin/synthesize_virtual_dvs_grid.py

@@ -1,0 +1,6 @@
+[Unit]
+Description=Capture timestamped USB camera snapshot
+
+[Service]
+Type=oneshot
+ExecStart=/home/philip/bin/camera_snapshot.sh

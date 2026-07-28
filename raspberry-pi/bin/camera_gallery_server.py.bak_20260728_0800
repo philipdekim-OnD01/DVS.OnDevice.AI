@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote
+import html
+import json
+import os
+import shutil
+import tempfile
+import subprocess
+import time
+import datetime
+
+
+SNAPSHOT_DIR = Path("/home/philip/camera_snapshots")
+PERSON_DIR = Path("/home/philip/person_snapshots")
+LOG_FILE = Path("/home/philip/.local/state/camera-snapshots/capture.log")
+PERSON_LOG_FILE = Path("/home/philip/.local/state/camera-snapshots/person-events.log")
+TEMP_HISTORY_FILE = Path("/home/philip/.local/state/camera-snapshots/temperature-history.json")
+ROOT_WATCHDOG_LOG = Path("/var/log/camera-root-watchdog/watchdog.log")
+POWER_SAMPLE_LOG = Path("/home/philip/.local/state/camera-snapshots/power-samples.log")
+THERMAL_GUARD_LOG = Path("/var/log/pi-thermal-clock-guard.log")
+TEMP_HISTORY_SECONDS = 24 * 60 * 60
+TEMP_HISTORY_MAX_POINTS = 28800
+
+
+def read_text(path, default=""):
+    try:
+        return Path(path).read_text(errors="replace")
+    except OSError:
+        return default
+
+
+def run_text(args):
+    try:
+        return subprocess.check_output(args, stderr=subprocess.DEVNULL, text=True, timeout=2).strip()
+    except Exception:
+        return ""
+
+
+LAST_CPU_SAMPLE = None
+TEMP_HISTORY = []
+TEMP_HISTORY_LOADED = False
+
+
+def cpu_usage_percent():
+    global LAST_CPU_SAMPLE
+    try:
+        parts = read_text("/proc/stat").splitlines()[0].split()[1:]
+        vals = [int(x) for x in parts]
+    except Exception:
+        return 0.0
+
+    idle = vals[3] + vals[4]
+    total = sum(vals)
+    current = (idle, total)
+
+    if LAST_CPU_SAMPLE is None:
+        LAST_CPU_SAMPLE = current
+        load = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
+        cores = os.cpu_count() or 1
+        return max(0.0, min(100.0, load / cores * 100.0))
+
+    prev_idle, prev_total = LAST_CPU_SAMPLE
+    LAST_CPU_SAMPLE = current
+    total_delta = total - prev_total
+    idle_delta = idle - prev_idle
+    if total_delta <= 0:
+        return 0.0
+    return max(0.0, min(100.0, 100.0 * (1.0 - idle_delta / total_delta)))
+
+
+def memory_status():
+    values = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        if ":" not in line:
+            continue
+        key, rest = line.split(":", 1)
+        try:
+            values[key] = int(rest.strip().split()[0])
+        except Exception:
+            pass
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable", 0)
+    used = max(0, total - available)
+    pct = (used / total * 100.0) if total else 0.0
+    return used // 1024, total // 1024, pct
+
+
+def get_temperature():
+    out = run_text(["vcgencmd", "measure_temp"])
+    if out:
+        return out.replace("temp=", "")
+    raw = read_text("/sys/class/thermal/thermal_zone0/temp").strip()
+    if raw.isdigit():
+        return f"{int(raw) / 1000:.1f}'C"
+    return "n/a"
+
+
+def parse_temperature_c(value):
+    try:
+        return float(str(value).replace("temp=", "").replace("'C", "").replace("C", "").strip())
+    except Exception:
+        return None
+
+
+def load_temperature_history():
+    global TEMP_HISTORY_LOADED
+    if TEMP_HISTORY_LOADED:
+        return
+    TEMP_HISTORY_LOADED = True
+    try:
+        loaded = json.loads(TEMP_HISTORY_FILE.read_text())
+    except Exception:
+        loaded = []
+    now = int(time.time())
+    cutoff = now - TEMP_HISTORY_SECONDS
+    for item in loaded:
+        try:
+            ts = int(item["ts"])
+            temp_c = float(item["temp_c"])
+        except Exception:
+            continue
+        if ts >= cutoff:
+            TEMP_HISTORY.append({"ts": ts, "temp_c": temp_c})
+    del TEMP_HISTORY[:-TEMP_HISTORY_MAX_POINTS]
+
+
+def save_temperature_history():
+    try:
+        TEMP_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="temperature-history.", suffix=".tmp", dir=str(TEMP_HISTORY_FILE.parent))
+        with os.fdopen(fd, "w") as tmp:
+            json.dump(TEMP_HISTORY, tmp, separators=(",", ":"))
+        os.replace(tmp_name, TEMP_HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def record_temperature(value):
+    load_temperature_history()
+    temp_c = parse_temperature_c(value)
+    if temp_c is None:
+        return
+    now = int(time.time())
+    if TEMP_HISTORY and now - TEMP_HISTORY[-1]["ts"] < 2:
+        TEMP_HISTORY[-1] = {"ts": now, "temp_c": temp_c}
+    else:
+        TEMP_HISTORY.append({"ts": now, "temp_c": temp_c})
+    cutoff = now - TEMP_HISTORY_SECONDS
+    while TEMP_HISTORY and TEMP_HISTORY[0]["ts"] < cutoff:
+        TEMP_HISTORY.pop(0)
+    del TEMP_HISTORY[:-TEMP_HISTORY_MAX_POINTS]
+    save_temperature_history()
+
+
+def get_throttled():
+    out = run_text(["vcgencmd", "get_throttled"])
+    return out.replace("throttled=", "") if out else "n/a"
+
+
+def service_state(unit):
+    out = run_text(["systemctl", "--user", "is-active", unit])
+    return out or "unknown"
+
+
+def list_images(directory=SNAPSHOT_DIR):
+    items = []
+    for path in directory.glob("*.jpg"):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        items.append({"name": path.name, "mtime": st.st_mtime, "size": st.st_size})
+    return sorted(items, key=lambda x: x["mtime"], reverse=True)
+
+
+def format_age(ts):
+    seconds = max(0, int(time.time() - ts))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    return f"{minutes // 60}h {minutes % 60}m ago"
+
+
+
+def parse_hz(value):
+    try:
+        return float(str(value).strip()) / 1000000000.0
+    except Exception:
+        return None
+
+
+def parse_volts(value):
+    text = str(value).replace("volt=", "").replace("V", "").strip()
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def parse_root_watchdog_history():
+    points = []
+    cutoff = time.time() - TEMP_HISTORY_SECONDS
+    lines = []
+    for log_path in (POWER_SAMPLE_LOG, ROOT_WATCHDOG_LOG):
+        try:
+            lines.extend(log_path.read_text(errors="ignore").splitlines()[-12000:])
+        except Exception:
+            pass
+    for line in lines[-16000:]:
+        if " hw " not in line or "temp=" not in line:
+            continue
+        try:
+            ts_text = line[:19]
+            dt = datetime.datetime.strptime(ts_text, "%Y-%m-%d %H:%M:%S")
+            ts = dt.timestamp()
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        point = {"ts": ts, "temp_c": None, "throttled": "", "core_volts": None, "arm_clock_ghz": None}
+        for token in line.split():
+            if token.startswith("throttled="):
+                point["throttled"] = token.split("=", 1)[1]
+            elif token.startswith("temp="):
+                point["temp_c"] = parse_temperature_c(token.split("=", 1)[1])
+            elif token.startswith("volt="):
+                point["core_volts"] = parse_volts(token.split("=", 1)[1])
+            elif token.startswith("arm_clock="):
+                point["arm_clock_ghz"] = parse_hz(token.split("=", 1)[1])
+            elif token.startswith("snapshot="):
+                point["snapshot"] = token.split("=", 1)[1].rsplit("/", 1)[-1]
+        if point["temp_c"] is None:
+            continue
+        points.append(point)
+    points.sort(key=lambda x: x["ts"])
+    deduped = []
+    seen = set()
+    for point in points:
+        key = (int(point["ts"]), point.get("snapshot", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(point)
+    return deduped[-TEMP_HISTORY_MAX_POINTS:]
+
+def get_status():
+    images = list_images()
+    person_images = list_images(PERSON_DIR)
+    used_mb, total_mb, mem_pct = memory_status()
+    disk = shutil.disk_usage(SNAPSHOT_DIR)
+    latest = images[0] if images else None
+    log_tail = read_text(LOG_FILE).splitlines()[-8:]
+    person_log_tail = read_text(PERSON_LOG_FILE).splitlines()[-8:]
+    temp = get_temperature()
+    record_temperature(temp)
+    return {
+        "cpu_pct": cpu_usage_percent(),
+        "mem_used_mb": used_mb,
+        "mem_total_mb": total_mb,
+        "mem_pct": mem_pct,
+        "temp": temp,
+        "temp_history": TEMP_HISTORY,
+        "temp_history_hours": 24,
+        "power_history": parse_root_watchdog_history(),
+        "throttled": get_throttled(),
+        "arm_clock": run_text(["vcgencmd", "measure_clock", "arm"]).replace("frequency(0)=", ""),
+        "core_volts": run_text(["vcgencmd", "measure_volts", "core"]).replace("volt=", ""),
+        "arm_mem": run_text(["vcgencmd", "get_mem", "arm"]).replace("arm=", ""),
+        "gpu_mem": run_text(["vcgencmd", "get_mem", "gpu"]).replace("gpu=", ""),
+        "cpu_thermal_type": read_text("/sys/class/thermal/thermal_zone0/type").strip() or "n/a",
+        "usb_devices": run_text(["lsusb"]).splitlines(),
+        "video_devices": run_text(["sh", "-c", "v4l2-ctl --list-devices 2>/dev/null"]).splitlines(),
+        "i2c_devices": run_text(["sh", "-c", "ls -1 /dev/i2c-* 2>/dev/null"]).splitlines(),
+        "gpio_devices": run_text(["sh", "-c", "ls -1 /dev/gpiomem* 2>/dev/null"]).splitlines(),
+        "capture_timer": service_state("camera-snapshot.timer"),
+        "thermal_guard": run_text(["systemctl", "is-active", "pi-thermal-clock-guard.timer"]) or "unknown",
+        "thermal_guard_tail": read_text(THERMAL_GUARD_LOG).splitlines()[-3:],
+        "web_service": service_state("camera-snapshots-web.service"),
+        "image_count": len(images),
+        "person_event_count": len(person_images),
+        "latest_name": latest["name"] if latest else "",
+        "latest_age": format_age(latest["mtime"]) if latest else "n/a",
+        "disk_free_gb": disk.free / 1024 / 1024 / 1024,
+        "log_tail": log_tail,
+        "person_log_tail": person_log_tail,
+        "images": [
+            {
+                "name": item["name"],
+                "age": format_age(item["mtime"]),
+                "size_kb": round(item["size"] / 1024),
+                "mtime": int(item["mtime"]),
+            }
+            for item in images[:120]
+        ],
+        "person_images": [
+            {
+                "name": item["name"],
+                "age": format_age(item["mtime"]),
+                "size_kb": round(item["size"] / 1024),
+                "mtime": int(item["mtime"]),
+            }
+            for item in person_images[:80]
+        ],
+    }
+
+
+def pct_style(value):
+    value = max(0, min(100, float(value)))
+    return f"width:{value:.1f}%"
+
+
+def render_person_page():
+    images = list_images(PERSON_DIR)
+    cards = []
+    for img in images[:240]:
+        name = html.escape(img["name"])
+        age = html.escape(format_age(img["mtime"]))
+        size_kb = img["size"] / 1024
+        cards.append(f'''
+          <a class="thumb" href="/person-image/{name}" data-src="/person-image/{name}" data-name="{name}" title="{name}">
+            <img src="/person-image/{name}" loading="lazy" alt="{name}">
+            <span class="thumb-meta"><b>{name}</b><small>{age} · {size_kb:.0f} KB</small></span>
+          </a>
+        ''')
+
+    return f'''<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Person Events</title>
+  <style>
+    :root {{ color-scheme: dark; --bg:#101214; --panel:#191d21; --line:#303840; --text:#edf2f4; --muted:#9aa6ad; --accent:#5cc8a7; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }}
+    header {{ position:sticky; top:0; z-index:5; background:rgba(16,18,20,.92); backdrop-filter:blur(14px); border-bottom:1px solid var(--line); }}
+    .bar {{ max-width:1480px; margin:0 auto; padding:14px 18px; display:flex; align-items:center; justify-content:space-between; gap:16px; }}
+    h1 {{ margin:0; font-size:20px; font-weight:720; }}
+    .sub {{ color:var(--muted); font-size:13px; }}
+    .nav {{ display:flex; gap:10px; align-items:center; }}
+    .link {{ color:var(--text); text-decoration:none; border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:var(--panel); font-size:13px; }}
+    main {{ max-width:1480px; margin:0 auto; padding:18px; }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(156px,1fr)); gap:12px; }}
+    .thumb {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; color:inherit; text-decoration:none; min-width:0; box-shadow:0 8px 24px rgba(0,0,0,.16); }}
+    .thumb:hover {{ border-color:#60717d; transform:translateY(-1px); transition:.12s ease; }}
+    .thumb img {{ width:100%; aspect-ratio:4 / 3; object-fit:contain; display:block; background:#050607; }}
+    .thumb-meta {{ display:block; padding:9px; min-width:0; }}
+    .thumb-meta b {{ display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }}
+    .thumb-meta small {{ display:block; color:var(--muted); margin-top:3px; font-size:11px; }}
+    .empty {{ color:var(--muted); }}
+  .global-nav{{position:sticky;top:0;z-index:30;display:flex;justify-content:center;align-items:center;gap:8px;padding:10px 12px;background:#111318;border-bottom:1px solid #30343d}}.global-nav a{{display:inline-flex;align-items:center;justify-content:center;min-width:86px;height:34px;padding:0 14px;border:1px solid #343d46;border-radius:6px;background:#1a1f25;color:#dbeafe;text-decoration:none;font-weight:700;font-size:14px;line-height:1;white-space:nowrap}}.global-nav a:hover{{background:#22303a;border-color:#5cc8a7;color:#ffffff}}@media(max-width:520px){{.global-nav{{gap:6px;padding:8px}}.global-nav a{{min-width:auto;height:32px;padding:0 10px;font-size:13px}}}}
+</style>
+</head>
+<body><div class="global-nav"><a href="/">Home</a><a href="/person">Person</a><a href="http://192.168.0.100:8081/">Synthetic</a></div>
+  <header>
+    <div class="bar">
+      <div>
+        <h1>Person Events</h1>
+        <div class="sub">{len(images)} detected snapshots · 24h retention</div>
+      </div>
+      <nav class="nav">
+        <a class="link" href="/">Dashboard</a>
+      </nav>
+    </div>
+  </header>
+  <main>
+    <section class="grid">{''.join(cards) if cards else '<div class="empty">No person events yet.</div>'}</section>
+  </main>
+</body>
+</html>'''
+
+
+def render_page():
+    images = list_images()
+    status = get_status()
+    latest = images[0] if images else None
+    cards = []
+    for img in images[:120]:
+        name = html.escape(img["name"])
+        age = html.escape(format_age(img["mtime"]))
+        size_kb = img["size"] / 1024
+        cards.append(f'''
+          <a class="thumb" href="/image/{name}" data-src="/image/{name}" data-name="{name}" title="{name}">
+            <img src="/image/{name}" loading="lazy" alt="{name}">
+            <span class="thumb-meta"><b>{name}</b><small>{age} · {size_kb:.0f} KB</small></span>
+          </a>
+        ''')
+    latest_html = ""
+    if latest:
+        latest_name = html.escape(latest["name"])
+        latest_html = f'<img class="hero-img" src="/image/{latest_name}?v={int(latest["mtime"])}" alt="{latest_name}">'
+    else:
+        latest_html = '<div class="empty">No snapshots yet</div>'
+
+    log_lines = "\n".join(html.escape(x) for x in status["log_tail"])
+    timer_class = "ok" if status["capture_timer"] == "active" else "warn"
+    web_class = "ok" if status["web_service"] == "active" else "warn"
+
+    return f'''<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera Snapshots</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg:#101214; --panel:#191d21; --panel2:#20262b; --line:#303840;
+      --text:#edf2f4; --muted:#9aa6ad; --accent:#5cc8a7; --warn:#ffbf69;
+      --blue:#7bb7ff;
+    }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }}
+    header {{ position:sticky; top:0; z-index:5; background:rgba(16,18,20,.92); backdrop-filter:blur(14px); border-bottom:1px solid var(--line); }}
+    .bar {{ max-width:1480px; margin:0 auto; padding:14px 18px; display:flex; align-items:center; justify-content:space-between; gap:16px; }}
+    h1 {{ margin:0; font-size:20px; font-weight:720; letter-spacing:0; }}
+    .sub {{ color:var(--muted); font-size:13px; }}
+    main {{ max-width:1480px; margin:0 auto; padding:18px; display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:18px; align-items:start; }}
+    .gallery-wrap {{ min-width:0; }}
+    .dialog {{ position:fixed; inset:0; z-index:20; display:none; align-items:center; justify-content:center; padding:24px; background:rgba(0,0,0,.78); backdrop-filter:blur(10px); }}
+    .dialog.open {{ display:flex; }}
+    .dialog-inner {{ max-width:min(96vw,1280px); max-height:92vh; display:flex; flex-direction:column; gap:10px; }}
+    .dialog img {{ max-width:100%; max-height:84vh; object-fit:contain; background:#050607; border:1px solid var(--line); border-radius:8px; }}
+    .dialog-bar {{ display:flex; align-items:center; justify-content:space-between; gap:12px; color:var(--text); }}
+    .close {{ border:1px solid var(--line); border-radius:8px; background:var(--panel2); color:var(--text); padding:8px 12px; cursor:pointer; }}
+    .side {{ display:flex; flex-direction:column; gap:12px; position:sticky; top:74px; max-height:calc(100vh - 92px); overflow:auto; padding-right:2px; }}
+    .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:13px; box-shadow:0 10px 30px rgba(0,0,0,.18); }}
+    .metric {{ display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; margin:10px 0; }}
+    .chart {{ width:100%; height:120px; margin-top:10px; border:1px solid var(--line); border-radius:8px; background:#0c0e10; }}
+    .chart-meta {{ display:flex; justify-content:space-between; gap:10px; margin-top:7px; color:var(--muted); font-size:11px; }}
+    .metric:first-child {{ margin-top:0; }}
+    .label {{ color:var(--muted); font-size:13px; }}
+    .value {{ font-size:13px; font-weight:700; }}
+    .track {{ grid-column:1 / -1; height:8px; border-radius:999px; background:#0c0e10; overflow:hidden; border:1px solid #252b31; }}
+    .fill {{ height:100%; background:linear-gradient(90deg,var(--accent),var(--blue)); }}
+    .pill {{ display:inline-flex; align-items:center; min-height:24px; padding:3px 8px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid var(--line); background:var(--panel2); }}
+    .top-link {{ color:var(--accent); text-decoration:none; }}
+    .top-link:hover {{ text-decoration:underline; }}
+    .ok {{ color:var(--accent); }}
+    .warn {{ color:var(--warn); }}
+    .grid-title {{ display:flex; align-items:end; justify-content:space-between; margin:0 0 12px; }}
+    h2 {{ margin:0; font-size:16px; }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(156px,1fr)); gap:12px; }}
+    .thumb {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; color:inherit; text-decoration:none; min-width:0; box-shadow:0 8px 24px rgba(0,0,0,.16); padding:0; text-align:left; cursor:pointer; font:inherit; }}
+    .thumb:hover {{ border-color:#60717d; transform:translateY(-1px); transition:.12s ease; }}
+    .thumb img {{ width:100%; aspect-ratio:4 / 3; object-fit:contain; display:block; background:#050607; }}
+    .thumb-meta {{ display:block; padding:9px; min-width:0; }}
+    .thumb-meta b {{ display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }}
+    .thumb-meta small {{ display:block; color:var(--muted); margin-top:3px; font-size:11px; }}
+    pre {{ margin:8px 0 0; white-space:pre-wrap; color:#cbd5da; font-size:11px; line-height:1.45; }}
+    .empty {{ color:var(--muted); }}
+    @media (max-width:980px) {{
+      main {{ grid-template-columns:1fr; }}
+      .side {{ position:static; max-height:none; overflow:visible; padding-right:0; }}
+    }}
+  .global-nav{{position:sticky;top:0;z-index:30;display:flex;justify-content:center;align-items:center;gap:8px;padding:10px 12px;background:#111318;border-bottom:1px solid #30343d}}.global-nav a{{display:inline-flex;align-items:center;justify-content:center;min-width:86px;height:34px;padding:0 14px;border:1px solid #343d46;border-radius:6px;background:#1a1f25;color:#dbeafe;text-decoration:none;font-weight:700;font-size:14px;line-height:1;white-space:nowrap}}.global-nav a:hover{{background:#22303a;border-color:#5cc8a7;color:#ffffff}}@media(max-width:520px){{.global-nav{{gap:6px;padding:8px}}.global-nav a{{min-width:auto;height:32px;padding:0 10px;font-size:13px}}}}
+</style>
+</head>
+<body><div class="global-nav"><a href="/">Home</a><a href="/person">Person</a><a href="http://192.168.0.100:8081/">Synthetic</a></div>
+  <header>
+    <div class="bar">
+      <div>
+        <h1>Camera Snapshots</h1>
+        <div class="sub">Latest: <span id="latest-name">{html.escape(status["latest_name"] or "none")}</span> · <span id="latest-age">{html.escape(status["latest_age"])}</span> · live refresh 3s</div>
+      </div>
+      <div class="pill"><a class="top-link" href="/person">Person events: <span id="person-count">{status["person_event_count"]}</span></a> · <span id="image-count">{status["image_count"]}</span> images</div>
+    </div>
+  </header>
+  <main>
+    <section class="gallery-wrap">
+      <div class="grid-title"><h2>Snapshots</h2><div class="sub">Newest first · click to enlarge</div></div>
+      <section class="grid" id="snapshot-grid">{''.join(cards) if cards else '<div class="empty">No images found.</div>'}</section>
+      <div class="grid-title person-title"><h2>Person events</h2><div class="sub">Detected separately · 24h retention</div></div>
+      <section class="grid" id="person-grid"><div class="empty">No person events yet.</div></section>
+    </section>
+    <aside class="side">
+      <section class="panel">
+        <div class="metric"><span class="label">CPU</span><span class="value" id="cpu-value">{status["cpu_pct"]:.1f}%</span><div class="track"><div class="fill" id="cpu-fill" style="{pct_style(status["cpu_pct"])}"></div></div></div>
+        <div class="metric"><span class="label">Memory</span><span class="value" id="mem-value">{status["mem_used_mb"]} / {status["mem_total_mb"]} MB</span><div class="track"><div class="fill" id="mem-fill" style="{pct_style(status["mem_pct"])}"></div></div></div>
+        <div class="metric"><span class="label">Temperature</span><span class="value" id="temp-value">{html.escape(status["temp"])}</span></div>
+        <div class="metric"><span class="label">Disk free</span><span class="value" id="disk-value">{status["disk_free_gb"]:.1f} GB</span></div>
+        <div class="metric"><span class="label">Throttle flag</span><span class="value" id="throttle-value">{html.escape(status["throttled"])}</span></div>
+        <div class="metric"><span class="label">CPU thermal</span><span class="value">{html.escape(status["cpu_thermal_type"])}</span></div>
+        <div class="metric"><span class="label">ARM clock</span><span class="value" id="clock-value">{html.escape(status["arm_clock"])}</span></div>
+        <div class="metric"><span class="label">Core voltage</span><span class="value" id="volts-value">{html.escape(status["core_volts"])}</span></div>
+        <div class="metric"><span class="label">ARM / GPU memory</span><span class="value">{html.escape(status["arm_mem"])} / {html.escape(status["gpu_mem"])}</span></div>
+        <div class="label">Temperature history · 24h</div>
+        <canvas class="chart" id="temp-chart" width="320" height="120"></canvas>
+        <div class="chart-meta"><span id="temp-chart-min">min</span><span id="temp-chart-max">max</span></div>
+        <div class="label" style="margin-top:14px">Power / thermal watchdog · 24h</div>
+        <canvas class="chart" id="power-chart" width="320" height="120"></canvas>
+        <div class="chart-meta"><span id="power-chart-min">min</span><span id="power-chart-max">max / throttle</span></div>
+      </section>
+      <section class="panel">
+        <div class="metric"><span class="label">Capture timer</span><span class="value {timer_class}" id="timer-value">{html.escape(status["capture_timer"])}</span></div>
+        <div class="metric"><span class="label">Web service</span><span class="value {web_class}" id="web-value">{html.escape(status["web_service"])}</span></div>
+        <div class="metric"><span class="label">Retention</span><span class="value">max 200, similar-first pruning</span></div>
+        <div class="metric"><span class="label">Interval</span><span class="value">3 seconds</span></div>
+        <div class="metric"><span class="label">Thermal guard</span><span class="value" id="thermal-guard-value">{html.escape(status["thermal_guard"])}</span></div>
+        <div class="label" style="margin-top:10px">Thermal guard log</div>
+        <pre id="thermal-guard-tail">{html.escape(chr(10).join(status["thermal_guard_tail"]))}</pre>
+      </section>
+      <section class="panel">
+        <div class="label">Connected devices</div>
+        <pre>{html.escape(chr(10).join(status["usb_devices"][:12]) or "none")}</pre>
+      </section>
+      <section class="panel">
+        <div class="label">Camera / video devices</div>
+        <pre>{html.escape(chr(10).join(status["video_devices"][:22]) or "none")}</pre>
+      </section>
+      <section class="panel">
+        <div class="label">GPIO / I2C</div>
+        <pre>{html.escape("I2C:\n" + (chr(10).join(status["i2c_devices"]) or "none") + "\n\nGPIO:\n" + (chr(10).join(status["gpio_devices"]) or "none"))}</pre>
+      </section>
+      <section class="panel">
+        <div class="label">Recent capture log</div>
+        <pre id="log-tail">{log_lines}</pre>
+        <div class="label" style="margin-top:10px">Recent person events</div>
+        <pre id="person-log-tail">{html.escape(chr(10).join(status["person_log_tail"]))}</pre>
+      </section>
+    </aside>
+  </main>
+  <div class="dialog" id="viewer" aria-hidden="true">
+    <div class="dialog-inner">
+      <div class="dialog-bar"><strong id="viewer-title"></strong><button class="close" type="button" id="viewer-close">Close</button></div>
+      <img id="viewer-img" src="" alt="">
+    </div>
+  </div>
+  <script>
+    const viewer = document.getElementById('viewer');
+    const viewerImg = document.getElementById('viewer-img');
+    const viewerTitle = document.getElementById('viewer-title');
+    const grid = document.getElementById('snapshot-grid');
+    let lastImageKey = '';
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({{
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }}[ch]));
+    const closeViewer = () => {{
+      viewer.classList.remove('open');
+      viewer.setAttribute('aria-hidden', 'true');
+      viewerImg.src = '';
+    }};
+    const openViewer = (src, name) => {{
+      viewerImg.src = src;
+      viewerImg.alt = name;
+      viewerTitle.textContent = name;
+      viewer.classList.add('open');
+      viewer.setAttribute('aria-hidden', 'false');
+    }};
+    const setText = (id, value) => {{
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    }};
+    const setWidth = (id, value) => {{
+      const el = document.getElementById(id);
+      if (el) el.style.width = `${{Math.max(0, Math.min(100, Number(value) || 0)).toFixed(1)}}%`;
+    }};
+    const renderImages = (images) => {{
+      if (viewer.classList.contains('open')) return;
+      const key = Array.isArray(images) ? images.map((img) => `${{img.name}}:${{img.mtime}}`).join('|') : '';
+      if (key === lastImageKey) return;
+      lastImageKey = key;
+      if (!Array.isArray(images) || images.length === 0) {{
+        grid.innerHTML = '<div class="empty">No images found.</div>';
+        return;
+      }}
+      grid.innerHTML = images.map((img) => {{
+        const name = escapeHtml(img.name);
+        const age = escapeHtml(img.age);
+        const size = escapeHtml(img.size_kb);
+        return `<button class="thumb" type="button" data-src="/image/${{name}}" data-name="${{name}}" title="${{name}}">
+          <img src="/image/${{name}}?v=${{img.mtime}}" loading="lazy" alt="${{name}}">
+          <span class="thumb-meta"><b>${{name}}</b><small>${{age}} · ${{size}} KB</small></span>
+        </a>`;
+      }}).join('');
+    }};
+    const drawTempChart = (history) => {{
+      const canvas = document.getElementById('temp-chart');
+      if (!canvas || !Array.isArray(history) || history.length === 0) return;
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+      const temps = history.map((p) => Number(p.temp_c)).filter((v) => Number.isFinite(v));
+      if (!temps.length) return;
+      const min = Math.floor(Math.min(...temps) - 1);
+      const max = Math.ceil(Math.max(...temps) + 1);
+      const range = Math.max(1, max - min);
+      ctx.strokeStyle = '#303840';
+      ctx.lineWidth = 1;
+      for (let i = 1; i < 4; i += 1) {{
+        const y = Math.round((height / 4) * i);
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      }}
+      ctx.strokeStyle = '#5cc8a7';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      history.forEach((point, index) => {{
+        const x = history.length === 1 ? width - 2 : (index / (history.length - 1)) * (width - 4) + 2;
+        const y = height - 8 - ((Number(point.temp_c) - min) / range) * (height - 16);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }});
+      ctx.stroke();
+      const last = temps[temps.length - 1];
+      setText('temp-chart-min', `min ${{Math.min(...temps).toFixed(1)}}°C`);
+      setText('temp-chart-max', `now ${{last.toFixed(1)}}°C / max ${{Math.max(...temps).toFixed(1)}}°C`);
+    }};
+
+
+    const drawPowerChart = (history) => {{
+      const canvas = document.getElementById('power-chart');
+      if (!canvas || !Array.isArray(history) || history.length === 0) return;
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#0c0e10';
+      ctx.fillRect(0, 0, width, height);
+      if (history.length < 2) {{
+        ctx.fillStyle = '#8b98a5';
+        ctx.font = '12px system-ui';
+        ctx.fillText('Waiting for power samples...', 12, 24);
+        return;
+      }}
+      const pad = {{left: 34, right: 34, top: 18, bottom: 20}};
+      const chartW = width - pad.left - pad.right;
+      const chartH = height - pad.top - pad.bottom;
+      const tsValues = history.map((p) => Number(p.ts)).filter((v) => Number.isFinite(v));
+      const minTs = Math.min(...tsValues);
+      const maxTs = Math.max(...tsValues);
+      const tempValues = history.map((p) => Number(p.temp_c)).filter((v) => Number.isFinite(v));
+      const voltValues = history.map((p) => Number(p.core_volts)).filter((v) => Number.isFinite(v));
+      const clockValues = history.map((p) => Number(p.arm_clock_ghz)).filter((v) => Number.isFinite(v));
+      const minTemp = Math.min(35, Math.floor(Math.min(...tempValues) - 2));
+      const maxTemp = Math.max(85, Math.ceil(Math.max(...tempValues) + 2));
+      const minVolt = voltValues.length ? Math.max(0.55, Math.min(...voltValues) - 0.03) : 0.65;
+      const maxVolt = voltValues.length ? Math.min(1.10, Math.max(...voltValues) + 0.03) : 1.00;
+      const minClock = clockValues.length ? Math.max(0, Math.min(...clockValues) - 0.15) : 0;
+      const maxClock = clockValues.length ? Math.max(2.5, Math.max(...clockValues) + 0.15) : 2.5;
+      const xFor = (ts) => pad.left + ((Number(ts) - minTs) / Math.max(1, maxTs - minTs)) * chartW;
+      const yFor = (v, min, max) => height - pad.bottom - ((v - min) / Math.max(0.0001, max - min)) * chartH;
+
+      ctx.strokeStyle = '#2a323a';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i += 1) {{
+        const y = pad.top + (chartH * i / 4);
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(width - pad.right, y);
+        ctx.stroke();
+      }}
+
+      const plot = (getter, min, max, color, lineWidth) => {{
+        let started = false;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth;
+        ctx.beginPath();
+        history.forEach((point) => {{
+          const value = Number(getter(point));
+          if (!Number.isFinite(value)) return;
+          const x = xFor(point.ts);
+          const y = yFor(value, min, max);
+          if (!started) {{ ctx.moveTo(x, y); started = true; }}
+          else ctx.lineTo(x, y);
+        }});
+        if (started) ctx.stroke();
+      }};
+
+      history.forEach((point) => {{
+        if (point.throttled && point.throttled !== '0x0') {{
+          const x = xFor(point.ts);
+          ctx.fillStyle = 'rgba(239,68,68,.22)';
+          ctx.fillRect(x - 1, pad.top, 3, chartH);
+        }}
+      }});
+      plot((p) => p.temp_c, minTemp, maxTemp, '#ef4444', 2.2);
+      plot((p) => p.core_volts, minVolt, maxVolt, '#3b82f6', 2);
+      plot((p) => p.arm_clock_ghz, minClock, maxClock, '#22c55e', 1.8);
+
+      const last = history[history.length - 1] || {{}};
+      const throttleCount = history.filter((p) => p.throttled && p.throttled !== '0x0').length;
+      ctx.font = '11px system-ui';
+      ctx.fillStyle = '#ef4444';
+      ctx.fillText(`${{maxTemp}}C`, 3, pad.top + 4);
+      ctx.fillText(`${{minTemp}}C`, 5, height - pad.bottom);
+      ctx.fillStyle = '#3b82f6';
+      ctx.fillText(`${{maxVolt.toFixed(2)}}V`, width - 32, pad.top + 4);
+      ctx.fillText(`${{minVolt.toFixed(2)}}V`, width - 32, height - pad.bottom);
+      setText('power-chart-min', `red temp / blue core V / green ARM GHz · samples ${{history.length}}`);
+      const lastTemp = Number.isFinite(Number(last.temp_c)) ? `${{Number(last.temp_c).toFixed(1)}}C` : 'n/a';
+      const lastVolt = Number.isFinite(Number(last.core_volts)) ? `${{Number(last.core_volts).toFixed(4)}}V` : 'n/a';
+      const lastClock = Number.isFinite(Number(last.arm_clock_ghz)) ? `${{Number(last.arm_clock_ghz).toFixed(2)}}GHz` : 'n/a';
+      setText('power-chart-max', `now ${{lastTemp}} / ${{lastVolt}} / ${{lastClock}} · events ${{throttleCount}}`);
+    }};
+
+    const refresh = async () => {{
+      try {{
+        const response = await fetch('/status.json', {{ cache: 'no-store' }});
+        if (!response.ok) return;
+        const data = await response.json();
+        setText('latest-name', data.latest_name || 'none');
+        setText('latest-age', data.latest_age || 'n/a');
+        setText('image-count', data.image_count ?? 0);
+        setText('person-count', data.person_event_count ?? 0);
+        setText('cpu-value', `${{Number(data.cpu_pct || 0).toFixed(1)}}%`);
+        setWidth('cpu-fill', data.cpu_pct);
+        setText('mem-value', `${{data.mem_used_mb}} / ${{data.mem_total_mb}} MB`);
+        setWidth('mem-fill', data.mem_pct);
+        setText('temp-value', data.temp || 'n/a');
+        drawTempChart(data.temp_history);
+        drawPowerChart(data.power_history);
+        setText('disk-value', `${{Number(data.disk_free_gb || 0).toFixed(1)}} GB`);
+        setText('throttle-value', data.throttled || 'n/a');
+        setText('clock-value', data.arm_clock || 'n/a');
+        setText('volts-value', data.core_volts || 'n/a');
+        setText('timer-value', data.capture_timer || 'unknown');
+        setText('web-value', data.web_service || 'unknown');
+        setText('log-tail', Array.isArray(data.log_tail) ? data.log_tail.join('\\n') : '');
+        renderImages(data.images);
+      }} catch (error) {{
+      }}
+    }};
+    document.addEventListener('click', (event) => {{
+      const button = event.target.closest('.thumb');
+      if (!button) return;
+      event.preventDefault();
+      openViewer(button.dataset.src || button.href, button.dataset.name || button.getAttribute('title') || 'snapshot');
+    }});
+    setInterval(refresh, 3000);
+    document.getElementById('viewer-close').addEventListener('click', closeViewer);
+    viewer.addEventListener('click', (event) => {{
+      if (event.target === viewer) closeViewer();
+    }});
+    document.addEventListener('keydown', (event) => {{
+      if (event.key === 'Escape') closeViewer();
+    }});
+  </script>
+</body>
+</html>'''
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/status.json":
+            data = json.dumps(get_status()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if self.path.startswith("/image/") or self.path.startswith("/person-image/"):
+            prefix = "/person-image/" if self.path.startswith("/person-image/") else "/image/"
+            directory = PERSON_DIR if prefix == "/person-image/" else SNAPSHOT_DIR
+            name = unquote(self.path.split(prefix, 1)[1].split("?", 1)[0])
+            if "/" in name or "\\" in name:
+                self.send_error(400)
+                return
+            path = directory / name
+            if not path.is_file() or path.suffix.lower() != ".jpg":
+                self.send_error(404)
+                return
+            data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if self.path in ("/person", "/person.html"):
+            data = render_person_page().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if self.path in ("/", "/index.html"):
+            data = render_page().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+if __name__ == "__main__":
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    server = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+    server.serve_forever()

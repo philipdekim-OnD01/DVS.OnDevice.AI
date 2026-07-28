@@ -1,0 +1,6 @@
+[Unit]
+Description=Keep Raspberry Pi image storage below 70 percent
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/philip/bin/disk_usage_guard.py

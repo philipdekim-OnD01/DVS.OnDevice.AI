@@ -1,0 +1,11 @@
+[Unit]
+Description=Create lightweight virtual DVS grid every 30 seconds
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=2s
+Unit=synthetic-grid-maker.service
+
+[Install]
+WantedBy=timers.target

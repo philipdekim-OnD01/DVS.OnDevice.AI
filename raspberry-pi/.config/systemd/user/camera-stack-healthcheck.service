@@ -1,0 +1,6 @@
+[Unit]
+Description=Raspberry Pi camera stack healthcheck
+
+[Service]
+Type=oneshot
+ExecStart=/home/philip/bin/camera_stack_healthcheck.sh

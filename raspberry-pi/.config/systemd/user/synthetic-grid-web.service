@@ -1,0 +1,11 @@
+[Unit]
+Description=Lightweight virtual DVS synthetic grid web
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/philip/bin/synthetic_grid_server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

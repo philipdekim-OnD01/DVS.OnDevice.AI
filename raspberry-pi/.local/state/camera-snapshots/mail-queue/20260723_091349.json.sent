@@ -1,0 +1,14 @@
+{
+  "id": "20260723_091349",
+  "created": "2026-07-23T09:13:50",
+  "to": "philip.de.kim@gmail.com",
+  "subject": "Raspberry Pi 사람 감지 다중사진 합성 영상: 20260723_091349",
+  "body": "사람 감지가 발생하여 여러 person 사진을 활용한 합성 영상을 생성했습니다.\n\nEvent ID: 20260723_091349\nMode: real_photo_grid_interleave\nOutput frames: 32\nVideo FPS: 20\nSource count: 6\nSource images: 20260723_091346_00.jpg, 20260723_091346_01.jpg, 20260723_091346_02.jpg, 20260723_091346_03.jpg, 20260723_091346_04.jpg, 20260723_091346_05.jpg\nGrid distribution: [6, 5, 5, 5, 5]\nShape mask: largest_motion_silhouette\n\n확인 링크:\n- Grid: http://192.168.0.100:8081/\n- Player: http://192.168.0.100:8081/play/20260723_091349\n\n이번 버전은 같은 사진 2장을 반복하지 않고, 최근 person 사진 시퀀스를 우선 사용합니다.",
+  "attachments": [
+    "/home/philip/synthetic_frames/20260723_091349/20260723_091349_00.jpg",
+    "/home/philip/synthetic_frames/20260723_091349/20260723_091349_01.jpg",
+    "/home/philip/synthetic_frames/20260723_091349/20260723_091349_02.jpg"
+  ],
+  "player_url": "http://192.168.0.100:8081/play/20260723_091349",
+  "grid_url": "http://192.168.0.100:8081/"
+}

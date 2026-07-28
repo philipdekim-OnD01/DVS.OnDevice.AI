@@ -1,0 +1,11 @@
+[Unit]
+Description=Camera snapshot gallery web dashboard
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/philip/bin/camera_gallery_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

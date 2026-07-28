@@ -1,0 +1,12 @@
+[Unit]
+Description=Capture USB camera snapshot every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=3s
+AccuracySec=1s
+Persistent=true
+Unit=camera-snapshot.service
+
+[Install]
+WantedBy=timers.target

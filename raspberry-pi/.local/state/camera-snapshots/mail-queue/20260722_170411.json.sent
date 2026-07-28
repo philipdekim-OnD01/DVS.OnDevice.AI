@@ -1,0 +1,14 @@
+{
+  "id": "20260722_170411",
+  "created": "2026-07-22T17:04:12",
+  "to": "philip.de.kim@gmail.com",
+  "subject": "Raspberry Pi 사람 감지 20프레임 합성 영상: 20260722_170411",
+  "body": "사람 감지가 발생하여 실제 burst 사진과 가상 DVS grid 프레임을 섞은 20프레임 영상을 생성했습니다.\n\nEvent ID: 20260722_170411\nMode: real_photo_grid_interleave\nOutput frames: 32\nVideo FPS: 20\nSource images: 20260722_170326.jpg, 20260722_170326.jpg\nGrid distribution: [30]\nVirtual event pixels: 325140\n\n확인 링크:\n- Grid: http://192.168.0.100:8081/\n- Player: http://192.168.0.100:8081/play/20260722_170411\n\n구성: 사진-그리드-사진-그리드 방식으로 실제 0.1초 burst 사진 사이를 가상 이벤트 프레임으로 채웠습니다.",
+  "attachments": [
+    "/home/philip/synthetic_frames/20260722_170411/20260722_170411_00.jpg",
+    "/home/philip/synthetic_frames/20260722_170411/20260722_170411_01.jpg",
+    "/home/philip/synthetic_frames/20260722_170411/20260722_170411_02.jpg"
+  ],
+  "player_url": "http://192.168.0.100:8081/play/20260722_170411",
+  "grid_url": "http://192.168.0.100:8081/"
+}
