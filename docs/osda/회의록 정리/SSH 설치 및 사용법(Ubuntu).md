@@ -1137,3 +1137,29 @@ gb_photo_white_plane_cooperative_dvs_events.
 - 커밋: 5b8a2cfeaa3d57455495deb313efdaae76c3c2c9 (Initial Raspberry Pi DVS backup)
 - 포함 범위: 라즈베리파이 /home/philip/bin, user systemd 서비스/타이머, camera-snapshots state/log/queue, camera/person snapshots, synthetic frames/virtual DVS chunks, 관련 Markdown/Word 문서 및 회의록.
 - 참고: 현재 백업은 이미지/합성 프레임까지 포함한 snapshot 백업이며 Git pack 크기는 약 567MB. 장기 이력 관리는 Git LFS 또는 object storage 검토 필요.
+
+## 2026-07-28 12:08:54 - OSDA Markdown 문서 GitHub 추가 백업
+
+- GitHub repo: https://github.com/philipdekim-OnD01/DVS.OnDevice.AI
+- 추가 커밋: 25f1cff7006bdb8c7b016785d372fef91fd18121 (Add OSDA markdown planning documents)
+- 추가 위치: docs/osda/
+- 포함 파일: C:\OSDA 하위 Markdown 전체 4개 (DVS.BIZ, 회의록 정리 포함).
+
+## 2026-07-28 12:17:10 - 웹 라우트/홈페이지 링크 백업 보강
+
+- GitHub repo: https://github.com/philipdekim-OnD01/DVS.OnDevice.AI
+- 추가 커밋: 7b4794abe5e0ef8bf78431596ec2b36af104a79b (Document dashboard routes and backup fall plan HTML)
+- 추가 파일: docs/web_routes.md, aspberry-pi/fall_detection_plan.html
+- 확인: event-synthesis는 별도 파일이 아니라 aspberry-pi/bin/camera_gallery_server.py 내부의 ender_event_synthesis_page()와 /event-synthesis 라우트로 구현되어 있음.
+- README에 http://192.168.0.100:8080/event-synthesis, /person, /fall-plan, 8081 링크 목록 추가.
+
+## 2026-07-28 12:48:57 - 현재 서비스 중인 웹페이지 전체 백업 재검증
+
+- GitHub repo: https://github.com/philipdekim-OnD01/DVS.OnDevice.AI
+- 추가 커밋: 9dc6d86 (Sync current dashboard pages and Pi5 assets)
+- 확인 결과: 라즈베리 현재 서비스 파일과 백업본 해시 일치.
+  - /home/philip/bin/camera_gallery_server.py -> aspberry-pi/bin/camera_gallery_server.py
+  - /home/philip/bin/synthetic_grid_server.py -> aspberry-pi/bin/synthetic_grid_server.py
+  - /home/philip/fall_detection_plan.html -> aspberry-pi/fall_detection_plan.html
+- 추가 반영: /raspberry-pi5-architecture, /pi5-asset/<name> 라우트와 aspberry-pi/pi5_arch_assets/ 이미지 4개 백업.
+- event-synthesis는 별도 HTML 파일이 아니라 camera_gallery_server.py 내부의 ender_event_synthesis_page()와 /event-synthesis 라우트로 구현됨.
