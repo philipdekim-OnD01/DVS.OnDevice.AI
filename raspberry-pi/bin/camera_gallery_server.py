@@ -22,6 +22,7 @@ POWER_SAMPLE_LOG = Path("/home/philip/.local/state/camera-snapshots/power-sample
 THERMAL_GUARD_LOG = Path("/var/log/pi-thermal-clock-guard.log")
 EVENT_SYNTH_DIR = Path("/home/philip/event_synthesis_demo")
 EVENT_SYNTH_OUTPUT_DIR = EVENT_SYNTH_DIR / "output"
+PI5_ARCH_ASSET_DIR = Path("/home/philip/pi5_arch_assets")
 TEMP_HISTORY_SECONDS = 24 * 60 * 60
 TEMP_HISTORY_MAX_POINTS = 28800
 
@@ -315,6 +316,24 @@ def pct_style(value):
     return f"width:{value:.1f}%"
 
 
+def render_global_nav():
+    return '''<div class="global-nav">
+  <a href="/">Home</a>
+  <span style="display:flex;align-items:center;gap:6px;padding-left:8px;border-left:1px solid #343d46">
+    <span style="color:#91a0ad;font-size:12px;font-weight:800;white-space:nowrap">기능</span>
+    <a href="/person">Person</a>
+    <a href="/raspberry-pi5-architecture">Pi 5 Architecture</a>
+    <a href="/event-synthesis">Event Synthesis</a>
+    <a href="http://192.168.0.100:8081/">Synthetic</a>
+  </span>
+  <span style="display:flex;align-items:center;gap:6px;padding-left:8px;border-left:1px solid #343d46">
+    <span style="color:#91a0ad;font-size:12px;font-weight:800;white-space:nowrap">제안서</span>
+    <a href="/space-edge-proposal">Space Edge</a>
+    <a href="/fall-plan">Fall Plan</a>
+  </span>
+</div>'''
+
+
 def render_person_page():
     images = list_images(PERSON_DIR)
     cards = []
@@ -357,7 +376,7 @@ def render_person_page():
   .global-nav{{position:sticky;top:0;z-index:30;display:flex;justify-content:center;align-items:center;gap:8px;padding:10px 12px;background:#111318;border-bottom:1px solid #30343d}}.global-nav a{{display:inline-flex;align-items:center;justify-content:center;min-width:86px;height:34px;padding:0 14px;border:1px solid #343d46;border-radius:6px;background:#1a1f25;color:#dbeafe;text-decoration:none;font-weight:700;font-size:14px;line-height:1;white-space:nowrap}}.global-nav a:hover{{background:#22303a;border-color:#5cc8a7;color:#ffffff}}@media(max-width:520px){{.global-nav{{gap:6px;padding:8px}}.global-nav a{{min-width:auto;height:32px;padding:0 10px;font-size:13px}}}}
 </style>
 </head>
-<body><div class="global-nav"><a href="/">Home</a><a href="/person">Person</a><a href="/event-synthesis">Event Synthesis</a><a href="http://192.168.0.100:8081/">Synthetic</a><a href="/fall-plan">Fall Plan</a></div>
+<body>{render_global_nav()}
   <header>
     <div class="bar">
       <div>
@@ -560,7 +579,7 @@ def render_event_synthesis_page():
   </style>
 </head>
 <body>
-  <div class="global-nav"><a href="/">Home</a><a href="/person">Person</a><a href="/event-synthesis">Event Synthesis</a><a href="http://192.168.0.100:8081/">Synthetic</a><a href="/fall-plan">Fall Plan</a></div>
+  {render_global_nav()}
   <div class="system-strip">
     <span class="sys">CPU <b id="es-cpu">{status["cpu_pct"]:.1f}%</b></span>
     <span class="sys">Memory <b id="es-mem">{status["mem_used_mb"]} / {status["mem_total_mb"]} MB</b></span>
@@ -602,6 +621,73 @@ events/000000.npz = images/000000 과 images/000001 사이 이벤트
 event fields = x, y, t, p</pre>
     </section>
 
+    <section class="block two">
+      <div>
+        <h2>Lightweight Reconstruction Explained</h2>
+        <p>이 방식은 딥러닝이 새 이미지를 상상해서 만드는 보간이 아니다. CIS 이미지 한 장을 기준 화면으로 두고, DVS 이벤트가 알려주는 밝아짐/어두워짐 변화를 그 위에 빠르게 더해서 중간 timestamp 이미지를 만든다.</p>
+        <pre>CIS frame = color, texture, background
+DVS event = where and when brightness changed
+
+synthetic_frame(t)
+  = CIS_anchor_frame
+  + accumulated_event_change(t0 -> t)</pre>
+        <p>DVS 이벤트의 `p` 값은 polarity다. `p=1`은 밝아지는 변화, `p=0`은 어두워지는 변화로 보고 같은 위치에 누적한다.</p>
+        <pre>p = 1 -> +1 brightness change
+p = 0 -> -1 brightness change
+
+synth = anchor + polarity_count * gain</pre>
+      </div>
+      <div>
+        <h2>Core Code</h2>
+        <pre>import cv2
+import numpy as np
+
+I0 = cv2.imread("images/000000.jpg").astype(np.float32)
+I1 = cv2.imread("images/000001.jpg").astype(np.float32)
+
+z = np.load("events/000000.npz")
+x = z["x"].astype(np.int32)
+y = z["y"].astype(np.int32)
+t = z["t"]
+p = z["p"]
+
+target_t = 10_000.0  # 10 ms
+mask = t <= target_t
+x, y, p = x[mask], y[mask], p[mask]
+
+h, w = I0.shape[:2]
+event_memory = np.zeros((h, w), np.float32)
+
+pos = p > 0
+np.add.at(event_memory, (y[pos], x[pos]), 1.0)
+np.add.at(event_memory, (y[~pos], x[~pos]), -1.0)
+
+contrast_gain = 4.8
+synth = I0 + event_memory[:, :, None] * contrast_gain
+synth = np.clip(synth, 0, 255).astype(np.uint8)</pre>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>Real-Time Loop Additions</h2>
+      <div class="flow">
+        <div class="step"><b>Decay</b><p>오래된 이벤트가 계속 남아 밝기 drift를 만들지 않도록 매 프레임 event memory를 줄인다.</p></div>
+        <div class="step"><b>Anchor blend</b><p>I0만 쓰면 시간이 갈수록 어긋나므로 I1을 약하게 섞어 다음 CIS 프레임 방향으로 잡아준다.</p></div>
+        <div class="step"><b>Scale correction</b><p>출력 해상도를 낮출 때 DVS x/y 좌표도 같은 비율로 줄여야 이벤트가 맞는 위치에 찍힌다.</p></div>
+        <div class="step"><b>Wall-clock test</b><p>목표 프레임을 끝까지 만드는 대신 5초 동안 실제 몇 프레임을 만들었는지 측정한다.</p></div>
+      </div>
+      <pre>event_memory *= 0.70
+
+new_events = events[(last_t < events.t) & (events.t <= target_t)]
+accumulate(new_events, event_memory)
+
+alpha = (target_t - t0) / (t1 - t0)
+anchor = I0 * (1 - 0.12 * alpha) + I1 * (0.12 * alpha)
+
+synth = anchor + event_memory[..., None] * contrast_gain</pre>
+      <p>장점은 빠르고 작은 장비에서도 동작한다는 점이다. 한계는 새로운 texture를 만들지 못하고, 큰 occlusion이나 이벤트가 부족한 영역에서는 품질이 떨어진다는 점이다. 그래서 이 방식은 실시간 preview 또는 작은 AI refinement 전 단계로 보는 것이 맞다.</p>
+    </section>
+
     <section class="block">
       <h2>Raspberry Pi Performance</h2>
       <table>
@@ -630,7 +716,10 @@ event fields = x, y, t, p</pre>
 OPS = Fout * (W * H * Cpix) + Esec * Cevent
 
 TOPS_required = OPS / 1e12 / efficiency</pre>
-        <p>1000프레임을 5초 안에 실시간 생성하려면 200FPS가 필요하다. 같은 데이터를 1초짜리 초고속 영상으로 생성하려면 1000FPS가 필요하다.</p>
+        <p>여기서 FPS는 playback FPS가 아니라 온디바이스가 실제 시간 1초 동안 만들어내는 synthesis FPS다. 1000프레임을 5초 안에 실시간 생성하려면 합성 엔진이 최소 200 synthesis FPS를 내야 한다. 2000프레임을 5초 안에 만들려면 400 synthesis FPS가 필요하다.</p>
+        <pre>1000 frames / 5s = 200 synthesis FPS
+2000 frames / 5s = 400 synthesis FPS
+1000 frames / 1s = 1000 synthesis FPS</pre>
       </div>
       <div>
         <h2>How To Increase Frames</h2>
@@ -642,6 +731,46 @@ TOPS_required = OPS / 1e12 / efficiency</pre>
           <li>합성 루프와 비디오 인코딩을 분리하고, 웹에는 최신 생성 MP4만 제공한다.</li>
           <li>실시간 200FPS 이상은 Python이 아니라 C++/OpenCV/NEON 또는 GPU compute 경로가 필요하다.</li>
         </ul>
+      </div>
+    </section>
+
+    <section class="block two">
+      <div>
+        <h2>What Hardware Must Be Strong At</h2>
+        <p>이 작업은 AI TOPS 하나로만 판단하면 안 된다. 병목은 프레임 전체를 매번 계산하는 픽셀 처리량과, 이벤트를 좌표별로 누적하는 random memory write다.</p>
+        <pre>required_pixel_rate = target_fps * width * height
+required_event_rate = input_events_per_second
+
+device_is_suitable if:
+  generated_fps >= required_synthesis_fps
+  sustained_event_rate >= peak_event_rate
+  encode_fps >= output_stream_fps
+  memory_bandwidth leaves enough headroom</pre>
+        <ul>
+          <li>픽셀 처리량: 200FPS 이상에서는 해상도 감소가 가장 큰 효과를 낸다.</li>
+          <li>이벤트 처리량: 평균 4.1M events/sec보다 피크 38M events/sec를 버틸 수 있어야 한다.</li>
+          <li>메모리 대역폭: event scatter, frame buffer, encode buffer가 동시에 돈다.</li>
+          <li>하드웨어 인코더: 합성 결과를 웹으로 보낼 때 CPU 인코딩을 피해야 한다.</li>
+          <li>동기화 입력: CIS와 DVS가 같은 시간축을 쓰도록 trigger/PPS/GPIO timestamp가 필요하다.</li>
+        </ul>
+      </div>
+      <div>
+        <h2>Is IQ8 Suitable?</h2>
+        <p>공식적으로 판단하면 IQ8 계열은 Raspberry Pi보다 이 구조에 더 적합하다. 이유는 AI TOPS 때문만이 아니라, 카메라 입력, ISP, 하드웨어 비디오 인코딩, 메모리 대역폭, GPU/DSP/NPU 같은 병렬 처리 블록을 함께 쓸 수 있기 때문이다.</p>
+        <pre>IQ8 suitability formula:
+
+if CSI_input >= 2 streams
+and hardware_encoder supports output_fps
+and GPU/DSP/NPU can run fusion_kernel
+and sustained_memory_bandwidth > frame_buffers + event_buffers
+then suitable_for_realtime_fusion = yes
+
+For 1000 frames / 5s:
+  required_synthesis_fps = 200
+
+For 2000 frames / 5s:
+  required_synthesis_fps = 400</pre>
+        <p>따라서 IQ8은 후보로 적합하다. 다만 TimeLens 같은 큰 딥러닝 interpolation을 그대로 올리는 방향보다, event accumulation과 contrast update를 GPU/DSP/NPU-friendly kernel로 바꾸는 쪽이 실시간 가능성이 높다.</p>
       </div>
     </section>
 
@@ -671,16 +800,66 @@ Production role:
 
     <section class="block two">
       <div>
+        <h2>High-Quality Interpolation Limits</h2>
+        <p>고품질 보간은 가능하지만, 전체 프레임 대형 neural interpolation을 200FPS 이상으로 실시간 처리하는 것은 어렵다. 현재 데모는 TimeLens류 고품질 모델이 아니라, 온디바이스 실시간 가능성을 확인하기 위한 lightweight event-based reconstruction이다.</p>
+        <pre>Lightweight synthesis:
+  CIS frame + DVS polarity accumulation
+  fast, lower compute, limited image quality
+
+High-quality interpolation:
+  CIS frame pair + event voxel + neural network
+  better quality, higher latency, larger memory use</pre>
+        <p>고품질 모델이 실시간이 되려면 inference, event preprocessing, postprocessing, encode handoff가 모두 프레임 budget 안에 들어와야 한다.</p>
+        <pre>model_latency_ms <= 1000 / required_synthesis_fps
+
+200 synthesis FPS -> <= 5.0 ms/frame
+400 synthesis FPS -> <= 2.5 ms/frame
+1000 synthesis FPS -> <= 1.0 ms/frame</pre>
+      </div>
+      <div>
+        <h2>IQ8 Practical Judgment</h2>
+        <p>IQ8은 Raspberry Pi보다 이 프로젝트에 훨씬 적합하다. 이유는 NPU TOPS만이 아니라 CPU, GPU, NPU, DSP, real-time MCU, multi-camera input, hardware video encoder를 함께 쓸 수 있는 heterogeneous compute 구조 때문이다.</p>
+        <pre>IQ8_is_suitable if:
+  camera_input >= 2 synchronized streams
+  and hardware_encoder_fps >= output_stream_fps
+  and fusion_kernel_fps >= required_synthesis_fps
+  and event_ingest_rate >= peak_event_rate
+  and memory_bandwidth has enough headroom</pre>
+        <ul>
+          <li>320x180~480x270 경량 neural refinement는 IQ8에서 가능성 있음.</li>
+          <li>960x540 고품질 neural interpolation @ 200FPS는 매우 어려움.</li>
+          <li>1080p 고품질 neural interpolation @ 200FPS 이상은 비현실적에 가까움.</li>
+          <li>TimeLens-XL급 큰 모델을 그대로 실시간 구동하는 방식은 IQ8에서도 어렵다.</li>
+          <li>작은 모델, ROI 처리, INT8 quantization, NPU/DSP/GPU 분산이 필요하다.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>Recommended Product Architecture</h2>
+      <pre>CIS camera -> ISP / DMA buffer
+DVS sensor -> packed event stream ring buffer
+Time sync -> trigger / PPS / GPIO timestamp
+Fusion core -> C++ / NEON / GPU / DSP tile accumulator
+Optional AI -> small INT8 ROI refinement model on NPU
+Output -> hardware H.264 / H.265 encoder
+Web -> preview stream + latest generated MP4</pre>
+      <p>최종 방향은 전체 프레임 대형 AI 보간이 아니라, 경량 실시간 합성 위에 선택적 AI refinement를 얹는 구조가 가장 현실적이다.</p>
+    </section>
+
+    <section class="block two">
+      <div>
         <h2>Lightweight Techniques</h2>
         <ul>
-          <li>전체 프레임 대신 ROI 또는 motion tile만 갱신한다.</li>
-          <li>이벤트를 x/y/t/p float NPZ가 아니라 packed binary로 저장한다.</li>
-          <li>프레임마다 전체 누적을 다시 계산하지 않고 rolling event buffer를 유지한다.</li>
-          <li>np.add.at scatter를 제거하고 tile-local histogram 후 한 번에 merge한다.</li>
-          <li>log/exp 모델은 LUT 또는 fixed-point contrast update로 바꾼다.</li>
-          <li>이벤트가 과도한 구간은 spatial/event rate throttling으로 균일하게 subsample한다.</li>
-          <li>CIS 프레임 decode, event fusion, video encode를 별도 thread/process로 pipeline 처리한다.</li>
-          <li>웹 재생용 파일은 H.264 yuv420p faststart 또는 WebRTC low-latency stream으로 낸다.</li>
+          <li><b>NPZ 대신 binary packed event stream</b>: 지금 NPZ는 zip 압축을 풀고 x/y/t/p 배열을 새로 만드는 비용이 크다. 실시간에서는 이벤트 하나를 8~12 byte 정도의 고정 구조체로 저장해 바로 읽는 편이 낫다.</li>
+          <li><b>np.add.at 제거</b>: np.add.at는 좌표가 흩어진 곳에 계속 더하는 random scatter라 느리다. C++에서 화면을 작은 tile로 나누고, 각 tile 안에서 histogram을 만든 뒤 합치면 cache 효율이 좋아진다.</li>
+          <li><b>SIMD-friendly histogram</b>: 이벤트를 한 점씩 처리하지 말고, x/y 좌표를 정렬하거나 tile별 bucket에 넣어 NEON/SIMD가 연속 메모리를 처리하게 만든다.</li>
+          <li><b>exp/log 제거</b>: log/exp는 품질은 좋지만 실시간에는 비싸다. 256 또는 1024 단계 LUT를 쓰거나, brightness += polarity_count * gain 같은 linear contrast update로 바꾼다.</li>
+          <li><b>rolling event buffer</b>: 매 출력 프레임마다 처음부터 이벤트를 다시 누적하지 않고, 오래된 이벤트는 빼고 새 이벤트만 더하는 ring buffer를 유지한다.</li>
+          <li><b>ROI/tile update</b>: 이벤트가 없는 영역은 CIS frame을 그대로 둔다. 움직임이 있는 tile만 갱신하면 960x540 전체를 매번 계산하지 않아도 된다.</li>
+          <li><b>합성 루프와 인코딩 분리</b>: fusion thread는 frame만 만들고, encoder thread가 별도로 H.264/H.265를 만든다. 두 작업을 한 루프에 넣으면 latency spike가 커진다.</li>
+          <li><b>웹 출력 단순화</b>: 실시간 스트림은 WebRTC/HLS로 보내고, 데모 페이지에는 최신 MP4 또는 낮은 FPS preview만 둔다. 웹서버가 합성 계산을 직접 하지 않게 한다.</li>
+          <li><b>Python 탈출</b>: 200FPS 이상은 Python/NumPy 프로토타입으로는 어렵다. C++/OpenCV/NEON, GPU compute, DSP, FPGA 중 하나로 핵심 누적 루프를 옮겨야 한다.</li>
         </ul>
       </div>
       <div>
@@ -722,6 +901,483 @@ Production role:
     setInterval(refreshSystem, 3000);
     refreshSystem();
   </script>
+</body>
+</html>'''
+
+
+def render_space_edge_proposal_page():
+    return '''<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Space Edge DVS Proposal</title>
+  <style>
+    :root { color-scheme:dark; --bg:#0f1114; --panel:#191d22; --panel2:#222832; --line:#343b45; --text:#edf2f4; --muted:#a6b0b8; --accent:#5cc8a7; --blue:#7bb7ff; --warn:#f6c96d; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .global-nav { position:sticky; top:0; z-index:30; display:flex; justify-content:center; align-items:center; gap:8px; padding:10px 12px; background:#111318; border-bottom:1px solid #30343d; flex-wrap:wrap; }
+    .global-nav a { display:inline-flex; align-items:center; justify-content:center; min-width:86px; height:34px; padding:0 14px; border:1px solid #343d46; border-radius:6px; background:#1a1f25; color:#dbeafe; text-decoration:none; font-weight:700; font-size:14px; line-height:1; white-space:nowrap; }
+    .global-nav a:hover { background:#22303a; border-color:#5cc8a7; color:#fff; }
+    header { border-bottom:1px solid var(--line); background:#15191f; }
+    .hero { max-width:1360px; margin:0 auto; padding:28px 18px 22px; display:grid; grid-template-columns:minmax(0,1.25fr) minmax(280px,.75fr); gap:22px; align-items:end; }
+    h1 { margin:0 0 10px; font-size:32px; line-height:1.15; letter-spacing:0; }
+    .lead { margin:0; color:var(--muted); font-size:15px; line-height:1.65; max-width:860px; }
+    .summary { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
+    .stat b { display:block; font-size:20px; }
+    .stat span { color:var(--muted); font-size:12px; }
+    main { max-width:1360px; margin:0 auto; padding:18px; display:grid; gap:18px; }
+    section.block { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    h2 { margin:0 0 10px; font-size:18px; letter-spacing:0; }
+    h3 { margin:16px 0 8px; font-size:15px; }
+    p { color:var(--muted); line-height:1.62; margin:8px 0; }
+    ul { margin:8px 0 0; padding-left:20px; color:var(--muted); line-height:1.65; }
+    pre { margin:10px 0 0; padding:12px; border:1px solid var(--line); border-radius:8px; background:#0b0d10; color:#d8dee5; white-space:pre-wrap; overflow:auto; font-family:ui-monospace, SFMono-Regular, Consolas, monospace; font-size:13px; line-height:1.5; }
+    .flow { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }
+    .step { border:1px solid var(--line); border-radius:8px; background:#11151a; padding:12px; }
+    .step b { color:var(--accent); }
+    .two { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { border-bottom:1px solid var(--line); padding:9px 8px; text-align:left; font-size:13px; vertical-align:top; }
+    th { color:#c7d2dc; background:#11151a; }
+    td { color:#edf2f4; }
+    a { color:#7dd3fc; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    .warn { color:var(--warn); }
+    @media(max-width:850px) { .hero, .two { grid-template-columns:1fr; } h1 { font-size:25px; } }
+  </style>
+</head>
+<body>
+  <div class="global-nav">
+  <a href="/">Home</a>
+  <span style="display:flex;align-items:center;gap:6px;padding-left:8px;border-left:1px solid #343d46">
+    <span style="color:#91a0ad;font-size:12px;font-weight:800;white-space:nowrap">기능</span>
+    <a href="/person">Person</a>
+    <a href="/event-synthesis">Event Synthesis</a>
+    <a href="http://192.168.0.100:8081/">Synthetic</a>
+  </span>
+  <span style="display:flex;align-items:center;gap:6px;padding-left:8px;border-left:1px solid #343d46">
+    <span style="color:#91a0ad;font-size:12px;font-weight:800;white-space:nowrap">제안서</span>
+    <a href="/space-edge-proposal">Space Edge</a>
+    <a href="/fall-plan">Fall Plan</a>
+  </span>
+</div>
+  <header>
+    <div class="hero">
+      <div>
+        <h1>Space Edge DVS On-Device Box Proposal</h1>
+        <p class="lead">DVS 센서와 CIS 카메라를 결합한 저전력 온디바이스 박스를 SpaceX/Starlink급 원격 인프라와 tactical edge 플랫폼에 적용하는 제안이다. 평상시에는 DVS 이벤트만 기록하고, 의미 있는 변화가 발생했을 때 CIS를 깨워 영상 합성과 사건 판단을 수행한 뒤 핵심 정보만 빠르게 전송한다.</p>
+      </div>
+      <div class="summary">
+        <div class="stat"><b>DVS idle</b><span>low-power always-on sensing</span></div>
+        <div class="stat"><b>CIS wake</b><span>capture only on event</span></div>
+        <div class="stat"><b>Edge AI</b><span>local summary before uplink</span></div>
+        <div class="stat"><b>Fast report</b><span>metadata-first transmission</span></div>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section class="block">
+      <h2>Executive Proposal</h2>
+      <p>원격 데이터센터, 위성 지상국, 우주/항공 설비, 드론 운용 환경에서는 모든 영상을 계속 전송하기 어렵다. 대역폭, 전력, 저장 공간, 지연 시간이 제한되기 때문이다. 이 제안의 핵심은 평상시에는 DVS 이벤트만 수집하고, 움직임·충격·섬광·침입·장비 이상 같은 이벤트가 발생하면 CIS를 깨워 짧은 burst 영상을 확보한 뒤, DVS와 CIS를 합성해 상황을 빠르게 판단하는 것이다.</p>
+      <pre>Normal mode:
+  DVS only -> tiny event stream -> low power storage
+
+Event mode:
+  DVS trigger -> wake CIS -> capture burst -> synthesize frames
+  -> classify event -> send compact incident packet to Earth / operator</pre>
+    </section>
+
+    <section class="block">
+      <h2>Why DVS Is Needed</h2>
+      <div class="flow">
+        <div class="step"><b>Bandwidth</b><p>RGB 영상을 항상 보내는 대신, 변화가 있을 때만 이벤트와 요약 영상을 보낸다.</p></div>
+        <div class="step"><b>Power</b><p>CIS/ISP/encoder를 계속 켜두지 않고, DVS가 event trigger 역할을 한다.</p></div>
+        <div class="step"><b>Latency</b><p>DVS는 motion/brightness change를 빠르게 감지하므로 사건 시작점을 놓칠 가능성이 줄어든다.</p></div>
+        <div class="step"><b>Evidence</b><p>이벤트 전후의 sparse motion trace와 CIS burst를 함께 보관해 원인 분석이 쉬워진다.</p></div>
+      </div>
+    </section>
+
+    <section class="block two">
+      <div>
+        <h2>On-Device Box Architecture</h2>
+        <pre>DVS sensor
+  -> always-on event ring buffer
+  -> event trigger detector
+
+CIS camera
+  -> normally sleeping or low FPS
+  -> wakes on DVS trigger
+  -> short burst capture
+
+Fusion engine
+  -> lightweight reconstruction
+  -> optional AI refinement/classifier
+
+Communication
+  -> event metadata first
+  -> thumbnail/contact sheet second
+  -> short H.264 clip only when needed</pre>
+      </div>
+      <div>
+        <h2>Incident Packet</h2>
+        <pre>{
+  "time": "UTC timestamp",
+  "event_type": "motion / flash / impact / anomaly",
+  "confidence": 0.0-1.0,
+  "location": "device or site id",
+  "event_rate": "events/sec",
+  "frames": "key thumbnails",
+  "clip": "optional short encoded video",
+  "raw_events": "optional compressed event slice"
+}</pre>
+        <p>전송 우선순위는 metadata, thumbnail, short clip, raw event 순서가 현실적이다. 링크 품질이 낮으면 metadata만 먼저 보내고, 대역폭이 회복되면 clip과 raw event를 보낸다.</p>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>SpaceX / Starlink Data-Center Use Case</h2>
+      <p>공개적으로 Starlink는 저궤도 위성을 사용해 저지연 인터넷을 제공하는 시스템으로 설명된다. 이 제안은 SpaceX 내부 시스템을 단정하는 것이 아니라, Starlink급 원격 통신/지상 인프라에서 유용한 edge sensing box의 적용 시나리오다.</p>
+      <table>
+        <thead><tr><th>Scenario</th><th>DVS role</th><th>CIS role</th><th>What gets sent</th></tr></thead>
+        <tbody>
+          <tr><td>Remote equipment room</td><td>motion, spark, flash, vibration-like visual change 감지</td><td>event 발생 시 현장 burst image 확보</td><td>event type, timestamp, thumbnails, short clip</td></tr>
+          <tr><td>Satellite ground site</td><td>평상시 sparse activity log 유지</td><td>침입/장비 이상/환경 변화 때만 활성화</td><td>operator alert plus compressed evidence</td></tr>
+          <tr><td>Space asset monitoring concept</td><td>continuous low-bandwidth visual change sensing</td><td>triggered context frame capture</td><td>priority packet over constrained link</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="block">
+      <h2>Starcloud Whitepaper Summary: Space Data Centers</h2>
+      <p>Starcloud의 공개 자료와 백서 소개는 데이터센터가 우주로 이동할 수 있는 이유를 세 가지로 설명한다. 첫째, 저궤도/태양동기궤도에서는 태양광을 거의 지속적으로 사용할 수 있다. 둘째, 우주는 물 냉각이나 칠러 대신 방열판으로 열을 우주 공간에 복사할 수 있다. 셋째, 지상 데이터센터가 겪는 토지, 전력망, 인허가 병목을 피하면서 모듈식으로 확장할 수 있다.</p>
+      <div class="flow">
+        <div class="step"><b>Power</b><p>우주에서는 대기 손실과 야간 문제가 작아 solar capacity factor가 높다. AI compute의 전력 병목을 줄이는 논리다.</p></div>
+        <div class="step"><b>Cooling</b><p>진공은 대류 냉각이 안 되지만, 큰 radiator로 폐열을 복사 방출한다. 물 사용량을 줄일 수 있는 대신 radiator 면적과 열전달 설계가 중요하다.</p></div>
+        <div class="step"><b>Scale</b><p>compute container, solar array, radiator를 모듈화하면 지상보다 빠르게 확장할 수 있다는 주장이다.</p></div>
+        <div class="step"><b>Data movement</b><p>대용량 원시 데이터를 모두 지구로 내리는 대신, 우주에서 inference/분석을 먼저 수행하고 결과만 전송하는 구조가 중요하다.</p></div>
+      </div>
+      <pre>Starcloud-style orbital data center:
+  compute container + solar array + passive radiator
+  optical link / constellation relay for data transport
+  in-space inference to reduce raw downlink
+
+Implication for this DVS box:
+  do not send all video all the time
+  process event data locally
+  transmit incident summary first
+  send short clip/raw event only when needed</pre>
+      <p>우리 제안의 DVS on-device box는 이 백서 논리와 잘 맞는다. 우주 데이터센터나 원격 지상국에서는 대역폭과 전력, 열 관리가 모두 제한되므로, 평상시 DVS-only로 sparse event를 기록하고 사건이 발생했을 때만 CIS와 AI를 깨우는 구조가 유리하다.</p>
+    </section>
+
+    <section class="block two">
+      <div>
+        <h2>Data-Center Monitoring Fit</h2>
+        <p>데이터센터는 서버 랙, 전력 장치, 냉각 장치, 출입 구역, 케이블/모듈 접속부처럼 지속 감시가 필요한 영역이 많다. 하지만 모든 카메라 영상을 항상 고해상도로 저장하거나 전송하면 저장 비용과 네트워크 비용이 커진다.</p>
+        <ul>
+          <li>DVS는 평상시 변화가 없으면 데이터가 거의 없다.</li>
+          <li>섬광, 스파크, 연기 전조, 급격한 움직임, 팬/패널 이상 같은 visual change를 빠르게 잡는다.</li>
+          <li>CIS는 이벤트 발생 시에만 깨워 색상, texture, 현장 context를 보완한다.</li>
+          <li>on-device classifier가 사건 유형을 먼저 판단해 operator에게 요약을 보낸다.</li>
+          <li>지구/중앙 관제에는 metadata, thumbnail, short clip 순서로 전송해 bandwidth를 줄인다.</li>
+        </ul>
+      </div>
+      <div>
+        <h2>Why Not Always-On RGB?</h2>
+        <table>
+          <thead><tr><th>Always-on RGB/CIS</th><th>DVS-triggered CIS</th></tr></thead>
+          <tbody>
+            <tr><td>항상 큰 영상 스트림 발생</td><td>변화가 있을 때만 데이터 증가</td></tr>
+            <tr><td>전력/열/저장 부담 큼</td><td>idle 전력과 저장량 감소</td></tr>
+            <tr><td>빠른 순간 변화는 motion blur 가능</td><td>DVS가 microsecond 단위 변화 포착</td></tr>
+            <tr><td>관제자가 많은 영상을 봐야 함</td><td>사건 중심 incident packet으로 요약</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="block two">
+      <div>
+        <h2>Palantir / Drone Edge Use Case</h2>
+        <p>Palantir는 공개적으로 tactical edge, defense decision making, edge AI 같은 방향을 강조한다. 드론 적용에서는 원본 영상을 계속 전송하기보다, 온디바이스에서 사건을 먼저 줄여서 판단 가능한 형태로 만드는 것이 가치가 있다.</p>
+        <pre>Drone normal flight:
+  DVS watches fast motion and flashes
+  CIS runs low FPS or sleeps
+
+Potential event:
+  wake CIS
+  synthesize missing frames
+  classify scene change locally
+  send compact event packet to command software</pre>
+        <p>이 접근은 통신이 끊기거나 대역폭이 낮은 환경에서 특히 유리하다. 단, 사람 추적/무기화된 자율 판단이 아니라 human-in-the-loop 상황 인식과 증거 압축 용도로 제한하는 설계가 바람직하다.</p>
+      </div>
+      <div>
+        <h2>Why It Fits Edge Platforms</h2>
+        <ul>
+          <li>영상 전체가 아니라 사건 중심 데이터만 보내므로 지휘 시스템의 부담이 줄어든다.</li>
+          <li>DVS는 빠른 움직임, 섬광, 갑작스러운 조도 변화를 포착하는 데 유리하다.</li>
+          <li>CIS는 필요한 순간에만 texture와 색 정보를 보완한다.</li>
+          <li>온디바이스 summary는 Palantir류 decision platform에 바로 ingest하기 쉽다.</li>
+          <li>raw event와 short clip을 함께 저장하면 사후 검증 가능성이 높아진다.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="block two">
+      <div>
+        <h2>Required Technology</h2>
+        <ul>
+          <li>DVS sensor with timestamped x/y/t/p event output</li>
+          <li>CIS camera with fast wake or low-power standby mode</li>
+          <li>shared clock, PPS, trigger, or GPIO timestamp sync</li>
+          <li>packed event ring buffer and event-rate trigger logic</li>
+          <li>C++/NEON/GPU/DSP lightweight reconstruction engine</li>
+          <li>small INT8 classifier or ROI refinement model</li>
+          <li>hardware H.264/H.265 encoder</li>
+          <li>secure event packet uplink and store-and-forward queue</li>
+        </ul>
+      </div>
+      <div>
+        <h2>Pros And Cons</h2>
+        <table>
+          <thead><tr><th>Pros</th><th>Cons / Risks</th></tr></thead>
+          <tbody>
+            <tr><td>낮은 idle 전력</td><td>DVS와 CIS 시간/공간 calibration 필요</td></tr>
+            <tr><td>대역폭 절감</td><td>이벤트가 부족하면 texture 복원 한계</td></tr>
+            <tr><td>빠른 이상 감지</td><td>큰 neural interpolation은 edge 실시간이 어려움</td></tr>
+            <tr><td>사건 중심 전송</td><td>오탐/미탐 threshold tuning 필요</td></tr>
+            <tr><td>raw event로 사후 분석 가능</td><td>radiation, vibration, thermal design 검증 필요</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>Performance Target</h2>
+      <pre>1000 frames / 5s = 200 synthesis FPS
+2000 frames / 5s = 400 synthesis FPS
+
+device_is_ready if:
+  synthesis_fps >= target_synthesis_fps
+  event_ingest_rate >= peak_event_rate
+  encoder_fps >= delivery_fps
+  power_budget is acceptable
+  thermal throttling does not occur</pre>
+      <p class="warn">Raspberry Pi 5는 PoC와 dashboard에는 적합하지만, 200~400 synthesis FPS의 제품 목표에는 C++/NEON 최적화 또는 IQ8/Jetson/FPGA-assisted SoC급 구성이 필요하다.</p>
+    </section>
+
+    <section class="block">
+      <h2>Reference Context</h2>
+      <ul>
+        <li><a href="https://starlink.com/us/technology" target="_blank">Starlink Technology</a>: low Earth orbit 기반 저지연 위성 인터넷 설명.</li>
+        <li><a href="https://www.starcloud.com/" target="_blank">Starcloud White Paper landing page</a>: space data center의 전력, 냉각, 확장성 논리.</li>
+        <li><a href="https://www.starcloud.com/blog/how-data-centres-in-space-sustainably-enable-the-ai-revolution" target="_blank">Starcloud Blog</a>: 우주 데이터센터가 AI 전력/냉각/인허가 병목을 줄인다는 설명.</li>
+        <li><a href="https://www.mckinsey.com/industries/technology-media-and-telecommunications/our-insights/the-case-for-data-centers-in-space" target="_blank">McKinsey interview with Starcloud</a>: orbital compute infrastructure, rack-scale system, inference workload 방향.</li>
+        <li><a href="https://www.palantir.com/offerings/defense/" target="_blank">Palantir Defense</a>: tactical edge와 defense decision software 방향.</li>
+        <li><a href="https://www.palantir.com/offerings/defense/solutions/" target="_blank">Palantir Defense Solutions</a>: edge AI, data-centric operations 관련 공개 설명.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>'''
+
+
+def render_pi5_architecture_page():
+    return '''<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Raspberry Pi 5 Architecture</title>
+  <style>
+    :root { color-scheme:dark; --bg:#0f1114; --panel:#191d22; --panel2:#222832; --line:#343b45; --text:#edf2f4; --muted:#a6b0b8; --accent:#5cc8a7; --blue:#7bb7ff; --warn:#f6c96d; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .global-nav { position:sticky; top:0; z-index:30; display:flex; justify-content:center; align-items:center; gap:8px; padding:10px 12px; background:#111318; border-bottom:1px solid #30343d; flex-wrap:wrap; }
+    .global-nav a { display:inline-flex; align-items:center; justify-content:center; min-width:86px; height:34px; padding:0 14px; border:1px solid #343d46; border-radius:6px; background:#1a1f25; color:#dbeafe; text-decoration:none; font-weight:700; font-size:14px; line-height:1; white-space:nowrap; }
+    .global-nav a:hover { background:#22303a; border-color:#5cc8a7; color:#fff; }
+    .nav-group { display:flex; align-items:center; gap:6px; padding-left:8px; border-left:1px solid #343d46; }
+    .nav-label { color:#91a0ad; font-size:12px; font-weight:800; white-space:nowrap; }
+    header { border-bottom:1px solid var(--line); background:#15191f; }
+    .hero { max-width:1360px; margin:0 auto; padding:28px 18px 22px; display:grid; grid-template-columns:minmax(0,1.0fr) minmax(320px,.9fr); gap:22px; align-items:center; }
+    h1 { margin:0 0 10px; font-size:32px; line-height:1.15; letter-spacing:0; }
+    .lead { margin:0; color:var(--muted); font-size:15px; line-height:1.65; max-width:820px; }
+    .hero img { width:100%; max-height:330px; object-fit:contain; background:#0b0d10; border:1px solid var(--line); border-radius:8px; }
+    main { max-width:1360px; margin:0 auto; padding:18px; display:grid; gap:18px; }
+    section.block { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    h2 { margin:0 0 10px; font-size:18px; letter-spacing:0; }
+    h3 { margin:16px 0 8px; font-size:15px; }
+    p { color:var(--muted); line-height:1.62; margin:8px 0; }
+    ul { margin:8px 0 0; padding-left:20px; color:var(--muted); line-height:1.65; }
+    pre { margin:10px 0 0; padding:12px; border:1px solid var(--line); border-radius:8px; background:#0b0d10; color:#d8dee5; white-space:pre; overflow:auto; font-family:ui-monospace, SFMono-Regular, Consolas, monospace; font-size:13px; line-height:1.45; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { border-bottom:1px solid var(--line); padding:9px 8px; text-align:left; font-size:13px; vertical-align:top; }
+    th { color:#c7d2dc; background:#11151a; }
+    td { color:#edf2f4; }
+    .two { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; }
+    .card { border:1px solid var(--line); border-radius:8px; background:#11151a; padding:12px; }
+    .card b { color:var(--accent); display:block; margin-bottom:4px; }
+    .image-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(270px,1fr)); gap:12px; }
+    figure { margin:0; border:1px solid var(--line); border-radius:8px; background:#11151a; overflow:hidden; }
+    figure img { width:100%; aspect-ratio:16/10; object-fit:contain; display:block; background:#0b0d10; }
+    figcaption { padding:9px 11px; color:var(--muted); font-size:12px; line-height:1.45; border-top:1px solid var(--line); }
+    a { color:#7dd3fc; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    @media(max-width:850px) { .hero, .two { grid-template-columns:1fr; } h1 { font-size:25px; } }
+  </style>
+</head>
+<body>
+  <div class="global-nav">
+    <a href="/">Home</a>
+    <span class="nav-group"><span class="nav-label">기능</span><a href="/person">Person</a><a href="/raspberry-pi5-architecture">Pi 5 Architecture</a><a href="/event-synthesis">Event Synthesis</a><a href="http://192.168.0.100:8081/">Synthetic</a></span>
+    <span class="nav-group"><span class="nav-label">제안서</span><a href="/space-edge-proposal">Space Edge</a><a href="/fall-plan">Fall Plan</a></span>
+  </div>
+  <header>
+    <div class="hero">
+      <div>
+        <h1>Raspberry Pi 5 구조, 성능, 인터페이스</h1>
+        <p class="lead">Raspberry Pi 5는 BCM2712 application processor와 RP1 I/O controller가 분리된 구조다. CPU/GPU/메모리/HDMI/PCIe 핵심 기능은 BCM2712 쪽에 있고, USB, Ethernet, GPIO, MIPI camera/display 같은 I/O는 RP1이 담당한다. 이 페이지는 DVS-CIS 합성 PoC 관점에서 Pi 5의 블록 구조와 인터페이스 한계를 정리한다.</p>
+      </div>
+      <img src="/pi5-asset/raspberry-pi-5.png" alt="Raspberry Pi 5 official image">
+    </div>
+  </header>
+  <main>
+    <section class="block image-grid">
+      <figure><img src="/pi5-asset/raspberry-pi-5.png" alt="Raspberry Pi 5 board"><figcaption>Raspberry Pi 5 board image, source: Raspberry Pi official product assets.</figcaption></figure>
+      <figure><img src="/pi5-asset/bcm2712.png" alt="BCM2712 SoC"><figcaption>BCM2712 application processor close-up. CPU, GPU, memory, HDMI, PCIe root-side functions are centered here.</figcaption></figure>
+      <figure><img src="/pi5-asset/rp1.png" alt="RP1 I/O controller"><figcaption>RP1 I/O controller close-up. RP1 handles much of the external I/O including USB, Ethernet, GPIO, and MIPI transceivers.</figcaption></figure>
+    </section>
+
+    <section class="block">
+      <h2>Top-Level Block Diagram</h2>
+      <pre>                         +-------------------------------+
+                         | Broadcom BCM2712 AP           |
+                         | - 4x Cortex-A76 @ 2.4GHz      |
+                         | - VideoCore VII GPU           |
+                         | - LPDDR4X-4267 controller     |
+                         | - Dual micro-HDMI 4Kp60       |
+                         | - 4Kp60 HEVC decode           |
+                         +---------------+---------------+
+                                         |
+                          PCIe 2.0 x4 internal link
+                                         |
+                         +---------------v---------------+
+                         | RP1 I/O Controller            |
+                         | - USB 3.0 / USB 2.0           |
+                         | - Gigabit Ethernet MAC        |
+                         | - 2x 4-lane MIPI transceivers |
+                         | - GPIO, UART, SPI, I2C, PWM   |
+                         +-----+------------+------------+
+                               |            |
+             +-----------------+            +------------------+
+             |                                      |
+       USB / Ethernet / GPIO              CAM/DISP0, CAM/DISP1
+                                          CSI-2 camera or DSI display
+
+External PCIe FPC:
+  BCM2712 -> PCIe 2.0 x1 connector for NVMe / accelerator HATs</pre>
+      <p>Pi 5의 중요한 특징은 RP1이다. RP1은 standalone MCU가 아니라 Pi 5 보드에 들어간 I/O controller이며, BCM2712와 internal PCIe 2.0 x4 link로 연결된다. 외부 확장용 PCIe는 별도의 FPC connector로 PCIe 2.0 x1이 제공된다.</p>
+    </section>
+
+    <section class="block">
+      <h2>Performance Summary</h2>
+      <table>
+        <thead><tr><th>Subsystem</th><th>Specification</th><th>DVS-CIS Fusion Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>CPU</td><td>Broadcom BCM2712, quad-core 64-bit Arm Cortex-A76 @ 2.4GHz</td><td>Python/NumPy PoC, orchestration, lightweight C++ fusion 가능. 200FPS 이상은 C++/NEON 최적화 필요.</td></tr>
+          <tr><td>GPU</td><td>VideoCore VII, OpenGL ES 3.1, Vulkan 1.3</td><td>GPU compute 가능성을 검토할 수 있지만 일반 CUDA 환경은 아님. Vulkan compute/GL path는 개발 난도가 있음.</td></tr>
+          <tr><td>Memory</td><td>LPDDR4X-4267, 1GB/2GB/4GB/8GB/16GB variants</td><td>event buffer, frame buffer, encode buffer 동시 운용. 8GB 이상 권장.</td></tr>
+          <tr><td>Video decode</td><td>4Kp60 HEVC decoder</td><td>입력 영상 decode에는 유리하나, 실시간 합성 병목은 event accumulation과 encode handoff.</td></tr>
+          <tr><td>Display</td><td>Dual 4Kp60 micro-HDMI with HDR support</td><td>데모 모니터링/대시보드에 충분.</td></tr>
+          <tr><td>I/O controller</td><td>RP1 via internal PCIe 2.0 x4 to BCM2712</td><td>USB, Ethernet, MIPI, GPIO를 RP1이 담당. 고속 I/O 부하와 CPU 연산을 분리하는 구조.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="block">
+      <h2>Interface Specifications</h2>
+      <table>
+        <thead><tr><th>Interface</th><th>Raspberry Pi 5 Spec</th><th>Notes For This Project</th></tr></thead>
+        <tbody>
+          <tr><td>MIPI camera/display</td><td>2x 4-lane MIPI transceivers, each usable as CSI-2 camera or DSI display</td><td>CIS camera input에 핵심. 두 커넥터를 모두 camera로 쓰거나 camera+display 조합 가능.</td></tr>
+          <tr><td>USB</td><td>2x USB 3.0 ports, simultaneous 5Gbps operation; 2x USB 2.0 ports</td><td>USB DVS sensor 또는 USB camera 입력 가능. USB DVS + MIPI CIS 조합이 현실적.</td></tr>
+          <tr><td>Ethernet</td><td>Gigabit Ethernet with PoE+ support via HAT</td><td>웹 대시보드, event packet 전송, remote monitoring에 사용.</td></tr>
+          <tr><td>PCIe external</td><td>PCIe 2.0 x1 FPC connector, adapter/HAT required</td><td>NVMe 저장장치 또는 AI accelerator 연결 가능. 외부 대역폭은 x1 한계가 있음.</td></tr>
+          <tr><td>microSD</td><td>High-speed SDR104 mode support</td><td>OS/간단 저장에는 충분하지만 event/video 장기 저장은 NVMe 권장.</td></tr>
+          <tr><td>GPIO</td><td>Raspberry Pi 40-pin header, 3.3V GPIO</td><td>DVS/CIS trigger, PPS, external sync, interrupt line 연결에 사용.</td></tr>
+          <tr><td>Low-speed buses</td><td>UART, SPI, I2C, I2S, PWM via GPIO mux</td><td>sensor control, IMU, temperature sensor, external MCU, lens control 등에 사용.</td></tr>
+          <tr><td>Power</td><td>5V/5A USB-C with Power Delivery support</td><td>카메라, USB 센서, NVMe, HAT 사용 시 전원 margin 중요. Active cooling 권장.</td></tr>
+          <tr><td>Wireless</td><td>Dual-band 802.11ac Wi-Fi, Bluetooth 5.0/BLE</td><td>개발/저대역 원격 접속에는 편리하지만 안정적 영상/이벤트 전송은 Ethernet 권장.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="block two">
+      <div>
+        <h2>CIS Camera Interface Detail</h2>
+        <p>Pi 5의 CIS 카메라 입력은 MIPI CSI-2를 사용한다. 보드에는 2개의 4-lane MIPI transceiver가 있으며, 각 커넥터는 camera 또는 display 용도로 사용할 수 있다. 공식 제품 설명에서는 이 커넥터를 camera/display transceiver라고 부른다.</p>
+        <pre>CIS sensor
+  -> MIPI CSI-2 data lanes
+  -> Pi 5 CAM/DISP connector
+  -> RP1 MIPI transceiver
+  -> BCM2712 / ISP path
+  -> application frame buffer</pre>
+        <ul>
+          <li>카메라 모듈은 Pi 5용 22-pin FFC/adapter compatibility를 확인해야 한다.</li>
+          <li>두 MIPI 포트 모두 camera로 쓰면 dual-CIS 입력 실험 가능.</li>
+          <li>DVS가 USB라면 CIS는 MIPI, DVS는 USB3로 분리하는 구성이 안정적이다.</li>
+          <li>DVS와 CIS의 timestamp sync는 GPIO trigger/PPS 또는 host monotonic clock 보정이 필요하다.</li>
+        </ul>
+      </div>
+      <div>
+        <h2>DVS-CIS Fusion Wiring Example</h2>
+        <pre>Recommended PoC wiring:
+
+MIPI CAM0:
+  CIS camera, 50FPS or burst capture
+
+USB 3.0:
+  DVS sensor event stream
+
+GPIO:
+  trigger / sync pulse / event interrupt
+
+Ethernet:
+  dashboard and result upload
+
+NVMe over PCIe x1:
+  optional raw event + video storage
+
+Cooling:
+  active cooler or case fan</pre>
+        <p>이 구성은 Pi 5에서 PoC를 만들기에 적합하다. 단, 200 synthesis FPS 이상 제품 목표에서는 Pi 5 CPU만으로는 부족하므로 C++/NEON, GPU compute, 또는 IQ8/Jetson/FPGA-assisted SoC로 확장해야 한다.</p>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>Pi 5 In This Project: Strengths And Limits</h2>
+      <div class="cards">
+        <div class="card"><b>Strength: fast prototyping</b><p>Python, OpenCV, web server, camera stack을 빠르게 붙여 실험 가능.</p></div>
+        <div class="card"><b>Strength: flexible I/O</b><p>MIPI CIS, USB DVS, Ethernet dashboard, GPIO sync를 한 보드에서 구성 가능.</p></div>
+        <div class="card"><b>Limit: no large NPU</b><p>고품질 neural interpolation을 온디바이스 200FPS로 돌리기에는 AI 가속 구조가 부족.</p></div>
+        <div class="card"><b>Limit: memory scatter</b><p>DVS event accumulation은 random write가 많아 Python/NumPy에서 병목이 큼.</p></div>
+        <div class="card"><b>Limit: thermal</b><p>장시간 합성/인코딩/USB 입력 부하에서는 active cooling과 안정 전원 필요.</p></div>
+        <div class="card"><b>Recommendation</b><p>Pi 5는 PoC와 dashboard, 저해상도 preview용. 제품은 IQ8/Jetson/FPGA급으로 이전.</p></div>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://www.raspberrypi.com/products/raspberry-pi-5/" target="_blank">Raspberry Pi 5 product specification</a></li>
+        <li><a href="https://www.raspberrypi.com/news/introducing-raspberry-pi-5/" target="_blank">Raspberry Pi 5 launch article: BCM2712, RP1, DA9091 architecture</a></li>
+        <li><a href="https://www.raspberrypi.com/documentation/computers/io-controllers.html" target="_blank">Raspberry Pi RP1 I/O controller documentation</a></li>
+        <li><a href="https://www.raspberrypi.com/documentation/computers/raspberry-pi.html" target="_blank">Raspberry Pi hardware documentation, PCIe connector</a></li>
+      </ul>
+    </section>
+  </main>
 </body>
 </html>'''
 
@@ -812,7 +1468,7 @@ def render_page():
   .global-nav{{position:sticky;top:0;z-index:30;display:flex;justify-content:center;align-items:center;gap:8px;padding:10px 12px;background:#111318;border-bottom:1px solid #30343d}}.global-nav a{{display:inline-flex;align-items:center;justify-content:center;min-width:86px;height:34px;padding:0 14px;border:1px solid #343d46;border-radius:6px;background:#1a1f25;color:#dbeafe;text-decoration:none;font-weight:700;font-size:14px;line-height:1;white-space:nowrap}}.global-nav a:hover{{background:#22303a;border-color:#5cc8a7;color:#ffffff}}@media(max-width:520px){{.global-nav{{gap:6px;padding:8px}}.global-nav a{{min-width:auto;height:32px;padding:0 10px;font-size:13px}}}}
 </style>
 </head>
-<body><div class="global-nav"><a href="/">Home</a><a href="/person">Person</a><a href="/event-synthesis">Event Synthesis</a><a href="http://192.168.0.100:8081/">Synthetic</a><a href="/fall-plan">Fall Plan</a></div>
+<body>{render_global_nav()}
   <header>
     <div class="bar">
       <div>
@@ -1172,6 +1828,46 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if include_body:
                 self.wfile.write(data)
+            return
+
+        if path_only in ("/space-edge-proposal", "/space-edge-proposal.html"):
+            data = render_space_edge_proposal_page().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if include_body:
+                self.wfile.write(data)
+            return
+
+        if path_only in ("/raspberry-pi5-architecture", "/raspberry-pi5-architecture.html"):
+            data = render_pi5_architecture_page().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if include_body:
+                self.wfile.write(data)
+            return
+
+        if path_only.startswith("/pi5-asset/"):
+            name = unquote(path_only.split("/pi5-asset/", 1)[1])
+            if "/" in name or "\\" in name:
+                self.send_error(400)
+                return
+            path = PI5_ARCH_ASSET_DIR / name
+            if not path.is_file() or path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                self.send_error(404)
+                return
+            content_type = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+            }[path.suffix.lower()]
+            self.send_file_response(path, content_type, include_body=include_body)
             return
 
         if path_only.startswith("/event-synthesis-video/"):
