@@ -1181,3 +1181,11 @@ gb_photo_white_plane_cooperative_dvs_events.
   - 8081 Open Player: /play/<event_id> 페이지들
 - 정적 asset 포함: dashboard snapshots, person images, event synthesis videos, synthetic grid videos/images, Pi5 architecture images.
 - 참고: GitHub Pages는 라즈베리 내부 Python 서버를 실행하지 않으므로 블로그 버전은 현재 시점의 정적 스냅샷 백업이다. 실시간 갱신은 라즈베리 8080/8081 서비스에서 확인한다.
+
+## 2026-07-28 13:15:00 - Pi5 아키텍처 업데이트 블로그 반영
+
+- GitHub blog repo: https://github.com/philipdekim-OnD01/obsidian-blog
+- 블로그 커밋: 22ef124 (Refresh Raspberry Pi 5 architecture export)
+- 반영 위치: dvs-ondevice-ai/raspberry-pi5-architecture.html
+- 수행 내용: 라즈베리 8080 서비스의 최신 /raspberry-pi5-architecture 페이지를 다시 export하고 GitHub Pages용 정적 HTML/assets에 반영.
+- 검증: dvs-ondevice-ai/*.html 내 http://192.168.0.100 및 루트 절대 링크 잔여 없음, 100MB 초과 파일 없음.
