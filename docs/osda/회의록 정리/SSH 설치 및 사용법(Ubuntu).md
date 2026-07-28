@@ -1163,3 +1163,21 @@ gb_photo_white_plane_cooperative_dvs_events.
   - /home/philip/fall_detection_plan.html -> aspberry-pi/fall_detection_plan.html
 - 추가 반영: /raspberry-pi5-architecture, /pi5-asset/<name> 라우트와 aspberry-pi/pi5_arch_assets/ 이미지 4개 백업.
 - event-synthesis는 별도 HTML 파일이 아니라 camera_gallery_server.py 내부의 ender_event_synthesis_page()와 /event-synthesis 라우트로 구현됨.
+
+## 2026-07-28 13:05:00 - 라즈베리 웹페이지 GitHub 블로그 정적 게시
+
+- GitHub blog repo: https://github.com/philipdekim-OnD01/obsidian-blog
+- 로컬 블로그 저장소: C:\Users\admin\obsidian-blog
+- 추가 위치: dvs-ondevice-ai/
+- 블로그 첫 화면 index.html의 Learning Notes 목록에 `DVS OnDevice AI Raspberry Pi Web Pages` 링크 추가.
+- 정적 export 대상:
+  - 8080 Dashboard: /
+  - 8080 Person snapshots: /person
+  - 8080 Space Edge Proposal: /space-edge-proposal
+  - 8080 Event Synthesis: /event-synthesis
+  - 8080 Raspberry Pi5 Architecture: /raspberry-pi5-architecture
+  - 8080 Fall Plan: /fall-plan
+  - 8081 Synthetic DVS Grid: /
+  - 8081 Open Player: /play/<event_id> 페이지들
+- 정적 asset 포함: dashboard snapshots, person images, event synthesis videos, synthetic grid videos/images, Pi5 architecture images.
+- 참고: GitHub Pages는 라즈베리 내부 Python 서버를 실행하지 않으므로 블로그 버전은 현재 시점의 정적 스냅샷 백업이다. 실시간 갱신은 라즈베리 8080/8081 서비스에서 확인한다.
