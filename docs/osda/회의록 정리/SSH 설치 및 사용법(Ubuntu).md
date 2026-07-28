@@ -1197,3 +1197,12 @@ gb_photo_white_plane_cooperative_dvs_events.
 - 반영 위치: dvs-ondevice-ai/
 - 수행 내용: 라즈베리 8080/8081에서 수정된 최신 웹페이지를 다시 export해 GitHub Pages용 정적 HTML/assets를 갱신.
 - 검증: dvs-ondevice-ai/*.html 내 http://192.168.0.100 및 루트 절대 링크 잔여 없음, 100MB 초과 파일 없음.
+
+## 2026-07-28 13:35:00 - 최신 DVS 웹페이지 블로그 추가 재업데이트
+
+- GitHub blog repo: https://github.com/philipdekim-OnD01/obsidian-blog
+- 블로그 커밋: cdafd7c (Refresh latest DVS web export)
+- 반영 위치: dvs-ondevice-ai/
+- 수행 내용: 라즈베리 8080/8081에서 다시 수정된 최신 웹페이지를 export해 GitHub Pages용 정적 HTML/assets를 갱신.
+- 특이사항: raspberry-pi5-architecture.html 변경량이 이전보다 커서 Pi5 아키텍처 수정 내용이 포함됨.
+- 검증: dvs-ondevice-ai/*.html 내 http://192.168.0.100 및 루트 절대 링크 잔여 없음, 100MB 초과 파일 없음.
